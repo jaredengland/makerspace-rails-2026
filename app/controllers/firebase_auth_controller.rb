@@ -12,6 +12,7 @@ require 'json'
 #   FIREBASE_PROJECT_ID — your Firebase project ID
 #
 class FirebaseAuthController < ApplicationController
+  prepend_before_action :prepare_mobile_session_persistence, only: :login
   GOOGLE_CERTS_URL = 'https://www.googleapis.com/robot/v1/metadata/x509/securetoken@system.gserviceaccount.com'.freeze
 
   def login
@@ -54,6 +55,7 @@ class FirebaseAuthController < ApplicationController
         lastname:     lastname,
         firebase_uid: firebase_uid,
         status:       'inactive',
+        signup_source_prompt_pending: true,
         role:         'member',
       )
       # Generate a random password so Devise is happy (member won't use it)
@@ -62,6 +64,11 @@ class FirebaseAuthController < ApplicationController
     end
 
     sign_in(:member, member)
+    # Successful provider authentication replaces any prior account's challenge,
+    # including stale state left after that account's session was invalidated.
+    session.delete(:totp_pending_member_id)
+    session.delete(:totp_pending_expires_at)
+    stage_mobile_session_persistence(member)
 
     # Check if TOTP is enrolled — require code entry before granting full
     # app access. A real Devise session already exists at this point (set
@@ -84,11 +91,12 @@ class FirebaseAuthController < ApplicationController
       return render json: member_json.merge(totp_enrollment_required: true)
     end
 
+    complete_mobile_session_persistence(member)
     render json: member, adapter: :attributes
   rescue => e
     Rails.logger.error "[FirebaseAuth] Login error: #{e.message}"
     Rails.logger.error "[FirebaseAuth] Backtrace: #{e.backtrace&.first(5)&.join(' | ')}"
-    Honeybadger.notify(e, context: { controller: 'FirebaseAuthController', action: 'login' })
+    Honeybadger.notify(e, context: { controller: 'FirebaseAuthController', action: 'login' }) if defined?(Honeybadger)
     render json: { message: 'Authentication failed' }, status: :internal_server_error
   end
 
@@ -107,7 +115,7 @@ class FirebaseAuthController < ApplicationController
     render json: { message: 'Member not found' }, status: :not_found
   rescue => e
     Rails.logger.error "[FirebaseAuth] Unlink error: #{e.message}"
-    Honeybadger.notify(e)
+    Honeybadger.notify(e) if defined?(Honeybadger)
     render json: { message: 'Failed to unlink Firebase account' }, status: :internal_server_error
   end
 
@@ -191,7 +199,7 @@ class FirebaseAuthController < ApplicationController
     JSON.parse(response.body)
   rescue => e
     Rails.logger.error "[FirebaseAuth] Failed to fetch Google certs: #{e.message}"
-    Honeybadger.notify(e, context: { controller: 'FirebaseAuthController', action: 'fetch_google_certs' })
+    Honeybadger.notify(e, context: { controller: 'FirebaseAuthController', action: 'fetch_google_certs' }) if defined?(Honeybadger)
     nil
   end
 end

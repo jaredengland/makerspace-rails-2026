@@ -13,16 +13,15 @@ module Service
         return nil
       end
 
-      unless ENV['SLACK_ADMIN_TOKEN'].present?
-        Rails.logger.info('Cannot update slack profile without a SLACK_ADMIN_TOKEN')
-        return nil
-      end
+      client = ::Service::SlackConnector.admin_client("users.profile.set")
+      return nil if client.nil?
 
-      client = Slack::Web::Client.new(token: ENV['SLACK_ADMIN_TOKEN'])
       profile = {}
       profile[status_field] = { value: status_profile_value(member) }
 
-      client.users_profile_set(user: slack_user.slack_id, profile: profile)
+      ::Service::SlackConnector.with_rate_limit_retry("users.profile.set") do
+        client.users_profile_set(user: slack_user.slack_id, profile: profile)
+      end
       member
     rescue Slack::Web::Api::Errors::SlackError => e
       ::Service::SlackConnector.send_slack_message(
@@ -39,9 +38,10 @@ module Service
       end
 
       unless ENV['SLACK_ADMIN_TOKEN'].present?
+        ::Service::SlackConnector.admin_client("users.profile.set")
         msg = '[Slack Profile Sync] ERROR: SLACK_ADMIN_TOKEN is not set'
         puts msg
-        Honeybadger.notify('Slack profile sync failed', context: { reason: 'SLACK_ADMIN_TOKEN not set' }) if defined?(Honeybadger)
+        Service::ErrorReporter.notify('Slack profile sync failed', context: { reason: 'SLACK_ADMIN_TOKEN not set' })
         raise msg
       end
 
@@ -52,8 +52,9 @@ module Service
       scope = Member.where(:expirationTime.ne => nil, :expirationTime.gt => (last_run_at || Time.at(0)).to_i * 1000)
       scope = scope.where(:expirationTime.lte => now.to_i * 1000)
 
+      members = scope.to_a.shuffle
       synced_count = 0
-      scope.each do |member|
+      members.each do |member|
         next if member.nil?
         sync_one(member)
         synced_count += 1
@@ -63,7 +64,7 @@ module Service
       { synced: synced_count, last_run_at: now }
     rescue => e
       puts "[Slack Profile Sync] ERROR: #{e.message}"
-      Honeybadger.notify('Slack profile sync failed', context: { error: e.message }) if defined?(Honeybadger)
+      Service::ErrorReporter.notify('Slack profile sync failed', context: { error: e.message })
       raise e
     end
 

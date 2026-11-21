@@ -2,12 +2,15 @@ class MemberMailer < ApplicationMailer
 
   def password_changed(member_id)
     @member = Member.find(member_id)
-    @google_doc_content = ::Service::EmailTemplate.render(:password_changed, {
+    @google_doc_content = ::Service::EmailTemplate.render(:password_changed, ::Service::EmailTemplate.common_variables(@member).merge(
       member_firstname: @member.firstname,
       url: base_url
-    })
-    template = @google_doc_content ? "shared/google_doc_email" : "member_mailer/password_changed"
-    mail to: @member.email, subject: "Your Manchester Makerspace password has been changed", template_path: "", template_name: template
+    ))
+    if @google_doc_content
+      mail to: @member.email, subject: "Your Manchester Makerspace password has been changed", template_path: "shared", template_name: "google_doc_email"
+    else
+      mail to: @member.email, subject: "Your Manchester Makerspace password has been changed"
+    end
   end
 
   def admin_password_reset(member_email, password_token)
@@ -17,9 +20,11 @@ class MemberMailer < ApplicationMailer
   end
 
   def welcome_email(email)
-    @google_doc_content = ::Service::EmailTemplate.render(:welcome_email, {
+    member = Member.find_by(email: email.to_s.downcase)
+    @google_doc_content = ::Service::EmailTemplate.render(:welcome_email, ::Service::EmailTemplate.common_variables(member).merge(
+      email: email,
       url: base_url
-    })
+    ))
     if @google_doc_content
       mail to: email, subject: "Welcome to Manchester Makerspace!", template_path: "shared", template_name: "google_doc_email"
     else
@@ -30,10 +35,12 @@ class MemberMailer < ApplicationMailer
   def welcome_email_manual_register(member_email, password_token)
     @reset_url = base_url + "resetPassword/#{password_token}"
     @member_email = member_email
-    @google_doc_content = ::Service::EmailTemplate.render(:welcome_email_manual_register, {
+    member = Member.find_by(email: member_email.to_s.downcase)
+    @google_doc_content = ::Service::EmailTemplate.render(:welcome_email_manual_register, ::Service::EmailTemplate.common_variables(member).merge(
       member_email: member_email,
+      email: member_email,
       reset_url: @reset_url
-    })
+    ))
     if @google_doc_content
       mail to: member_email, subject: "Welcome to Manchester Makerspace!", template_path: "shared", template_name: "google_doc_email"
     else
@@ -43,9 +50,9 @@ class MemberMailer < ApplicationMailer
 
   def member_registered(member_id)
     @member = Member.find(member_id)
-    @google_doc_content = ::Service::EmailTemplate.render(:member_registered, {
+    @google_doc_content = ::Service::EmailTemplate.render(:member_registered, ::Service::EmailTemplate.common_variables(@member).merge(
       member_name: @member.fullname
-    })
+    ))
     if @google_doc_content
       mail to: @member.email, cc: "contact@manchestermakerspace.org", subject: "Thank you for registering #{@member.fullname}", template_path: "shared", template_name: "google_doc_email"
     else
@@ -70,7 +77,117 @@ class MemberMailer < ApplicationMailer
     @member = Member.find(member_id)
     @primary_member = Member.find(primary_member_id)
     @primary_recipient = primary_recipient
-    mail to: @member.email, subject: "Manchester Makerspace Household Membership Update"
+    template = primary_recipient ? :household_disbanded_primary_email : :household_disbanded_secondary_email
+    @google_doc_content = ::Service::EmailTemplate.render(
+      template,
+      ::Service::EmailTemplate.common_variables(@member).merge(
+        primary_member_name: @primary_member.fullname,
+        support_email: 'contact@manchestermakerspace.org'
+      ),
+      fallback: true,
+      format: :html
+    )
+    mail to: @member.email,
+         subject: "Manchester Makerspace Household Membership Update",
+         template_path: 'shared',
+         template_name: 'google_doc_email'
+  end
+
+  def membership_expiring_soon(member_id)
+    @member = Member.find(member_id)
+    @google_doc_content = ::Service::EmailTemplate.render(
+      :membership_expiring_soon,
+      ::Service::EmailTemplate.common_variables(@member),
+      fallback: true,
+      format: :html
+    )
+    mail to: @member.email,
+         subject: "Your Manchester Makerspace membership expires soon",
+         template_path: 'shared',
+         template_name: 'google_doc_email'
+  end
+
+  def membership_expired(member_id)
+    @member = Member.find(member_id)
+    @google_doc_content = ::Service::EmailTemplate.render(
+      :membership_expired,
+      ::Service::EmailTemplate.common_variables(@member),
+      fallback: true,
+      format: :html
+    )
+    mail to: @member.email,
+         subject: "Your Manchester Makerspace membership has expired",
+         template_path: 'shared',
+         template_name: 'google_doc_email'
+  end
+
+  # paid_on is an ISO date string (Service::MemberReminders): the day of the member's first payment.
+  def fob_reminder(member_id, paid_on)
+    @member = Member.find(member_id)
+    variables = ::Service::EmailTemplate.common_variables(@member)
+      .merge(paid_date: Date.iso8601(paid_on.to_s).strftime('%B %-d, %Y'))
+    @google_doc_content = ::Service::EmailTemplate.render(
+      :fob_reminder,
+      variables,
+      fallback: true,
+      format: :html
+    )
+    mail to: @member.email,
+         subject: "Your Manchester Makerspace membership is paid. Come get your key fob",
+         template_path: 'shared',
+         template_name: 'google_doc_email'
+  end
+
+  # Sent to the address the primary typed, which may not belong to a member yet. The link carries the secret token; only its
+  # digest is stored, so the token is passed straight from the invitation service.
+  def household_invitation(invitation_id, token)
+    @invitation = HouseholdInvitation.find(invitation_id)
+    primary = @invitation.group&.member
+    base = Rails.configuration.x.try(:app_base_url).to_s.sub(%r{/$}, '')
+    variables = {
+      primary_name: primary&.fullname,
+      # The token is in the URL fragment, which the browser never sends to the server, so it stays out of request logs.
+      invite_url: "#{base}/household/join#token=#{token}",
+      expires_on: @invitation.expires_at.in_time_zone.strftime('%B %-d, %Y'),
+      portal_url: base,
+      base_url: base,
+      open_house_schedule: ENV['OPEN_HOUSE_SCHEDULE']
+    }
+    @google_doc_content = ::Service::EmailTemplate.render(:household_invitation, variables, fallback: true, format: :html)
+    mail to: @invitation.invited_email,
+         subject: "#{primary&.firstname || 'A member'} invited you to a Manchester Makerspace household membership",
+         template_path: 'shared',
+         template_name: 'google_doc_email'
+  end
+
+  # Sent to both adults when the second adult joins: member_id is who receives it, other_member_id the other adult.
+  def household_joined(member_id, other_member_id)
+    @member = Member.find(member_id)
+    other = Member.find(other_member_id)
+    @google_doc_content = ::Service::EmailTemplate.render(
+      :household_joined,
+      ::Service::EmailTemplate.common_variables(@member).merge(other_member_name: other.fullname),
+      fallback: true,
+      format: :html
+    )
+    mail to: @member.email,
+         subject: 'Your Manchester Makerspace household membership',
+         template_path: 'shared',
+         template_name: 'google_doc_email'
+  end
+
+  def signup_reminder(member_id)
+    @member = Member.find(member_id)
+    @google_doc_content = ::Service::EmailTemplate.render(
+      :signup_reminder,
+      ::Service::EmailTemplate.common_variables(@member),
+      fallback: true,
+      format: :html
+    )
+    mail to: @member.email,
+         subject: "Finish joining Manchester Makerspace",
+         template_path: 'shared',
+         template_name: 'google_doc_email'
   end
 
   def contract_updated(member_id)

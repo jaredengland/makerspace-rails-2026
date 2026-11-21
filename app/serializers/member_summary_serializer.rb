@@ -14,7 +14,16 @@ class MemberSummarySerializer < ActiveModel::Serializer
              :mailtrap,
              :slack,
              :checkout_approver_shop_ids,
-             :firebase_uid
+             :checkout_approver_tool_ids,
+             :resource_manager_shop_ids,
+             :slack_manual_deactivation_required,
+             :firebase_uid,
+             :merged_at,
+             :paid_pending_start,
+             :fob_issued,
+             :startDate
+
+  attribute :provisioning, if: :include_provisioning?
 
   attribute :is_checkout_approver do
     CheckoutApprover.exists?(member_id: object.id)
@@ -22,6 +31,10 @@ class MemberSummarySerializer < ActiveModel::Serializer
 
   attribute :checkout_approver_shop_ids do
     CheckoutApprover.find_by(member_id: object.id)&.shop_ids || []
+  end
+
+  attribute :checkout_approver_tool_ids do
+    CheckoutApprover.find_by(member_id: object.id)&.tool_ids || []
   end
 
   def member_contract_on_file
@@ -47,7 +60,7 @@ class MemberSummarySerializer < ActiveModel::Serializer
 
   def mailtrap
     event = current_email_mailtrap_event
-    return unknown_mailtrap_status unless event
+    return sent_mailtrap_status || unknown_mailtrap_status unless event
 
     {
       id: event.id,
@@ -74,6 +87,31 @@ class MemberSummarySerializer < ActiveModel::Serializer
     instance_options[:mailtrap_events_by_member_id_email][[object.id.to_s, current_email]]
   end
 
+  # Mailtrap has reported nothing for the current address, but an email was
+  # handed to SMTP for it. Report "sent" so a member who was just emailed is not
+  # shown the same way as one who has never been emailed.
+  def sent_mailtrap_status
+    message = current_email_mailtrap_message
+    return unless message
+
+    {
+      id: nil,
+      timestamp: message.created_at&.in_time_zone("Eastern Time (US & Canada)")&.iso8601,
+      email: message.email,
+      status: "sent",
+      value: "Sent, no delivery report yet"
+    }
+  end
+
+  def current_email_mailtrap_message
+    current_email = object.email.to_s.downcase
+    if instance_options.key?(:mailtrap_messages_by_member_id_email)
+      return instance_options[:mailtrap_messages_by_member_id_email][[object.id.to_s, current_email]]
+    end
+
+    MailtrapMessage.where(member_id: object.id, email: current_email).desc(:created_at).first
+  end
+
   def unknown_mailtrap_status
     {
       id: nil,
@@ -91,7 +129,49 @@ class MemberSummarySerializer < ActiveModel::Serializer
     {
       slack_id: slack_user.slack_id,
       name: slack_user.real_name.presence || slack_user.name,
-      url: ::Service::SlackConnector.slack_user_url(slack_user.slack_id)
+      # Home supplies its own cached-only channel link and must not resolve the
+      # workspace through Slack while rendering the member representation.
+      url: instance_options[:resolve_slack_url] == false ? nil : ::Service::SlackConnector.slack_user_url(slack_user.slack_id)
     }
+  end
+
+  def slack_manual_deactivation_required
+    object.status == "revoked" && !::Service::SlackConnector.admin_token_present?
+  end
+
+  def provisioning
+    ::Service::MemberProvisioning.provisioning_status(object)
+  end
+
+  def include_provisioning?
+    instance_options[:include_provisioning] == true
+  end
+
+  # True when a member has paid (a live subscription, or a settled invoice)
+  # but their membership hasn't actually started yet (no expirationTime) --
+  # covers both:
+  #   - the common, expected case: a real Braintree subscription exists and
+  #     is just waiting on the member's first fob registration.
+  #   - the anomalous case: a payment settled but nothing ever attached it
+  #     to a subscription or expiration at all -- a defensive signal for a
+  #     broken Braintree webhook/linkage, which should never happen in the
+  #     normal signup flow.
+  def paid_pending_start
+    return false if object.expirationTime.present?
+    return true if object.subscription_id.present?
+
+    Invoice.where(
+      resource_class: 'member',
+      resource_id:    object.id.to_s,
+      :settled_at.ne => nil
+    ).exists?
+  end
+
+  # Whether the member has ever been issued a fob (any card record, lost or not --
+  # the same test that holds a paid term until the first fob, Member#delay_invoice_operation).
+  # The portal uses it to flag a running term that has no fob behind it. The members
+  # list preloads access_cards, so this adds no query there.
+  def fob_issued
+    object.access_cards.to_a.any?
   end
 end

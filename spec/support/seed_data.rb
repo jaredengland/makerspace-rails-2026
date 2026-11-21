@@ -72,10 +72,25 @@ class SeedData
     create_historical_checkouts
     create_historical_volunteer_data
     create_historical_checkins
-    create_membership_snapshots
   end
 
   private
+
+  # Seed data is meant to model an "always active" fixture, but is only
+  # generated once per environment rather than freshly on every E2E run.
+  # A plain `create` with a hardcoded `Time.now + 1.year` expiration will
+  # eventually go stale (and silently break checkout-eligibility-dependent
+  # E2E specs) once real time closes that year-long gap. Refresh the
+  # expiration on every seed run instead of only setting it at creation.
+  def upsert_seed_member(factory, *traits, email:, expirationTime: nil, **attrs)
+    existing = Member.unscoped.find_by(email: email)
+    if existing
+      existing.update!(expirationTime: expirationTime) if expirationTime
+      existing
+    else
+      create(factory, *traits, email: email, expirationTime: expirationTime, **attrs)
+    end
+  end
 
   # ── E2E Members (unchanged) ───────────────────────────────────────────────
 
@@ -83,7 +98,7 @@ class SeedData
     create_expired_members
     create_admins
     MEMBER_COUNT.times do |n|
-      create(:member,
+      upsert_seed_member(:member,
         email:          "basic_member#{n}@test.com",
         firstname:      "Basic",
         lastname:       "Member#{n}",
@@ -91,7 +106,7 @@ class SeedData
       )
     end
     MEMBER_COUNT.times do |n|
-      create(:member,
+      upsert_seed_member(:member,
         email:          "paypal_member#{n}@test.com",
         firstname:      "PayPal",
         lastname:       "Member#{n}",
@@ -122,7 +137,7 @@ class SeedData
 
   def create_board_members
     MEMBER_COUNT.times do |n|
-      create(:member, :board_member,
+      upsert_seed_member(:member, :board_member,
         email:          "board_member#{n}@test.com",
         firstname:      "Board",
         lastname:       "Member#{n}",
@@ -133,7 +148,7 @@ class SeedData
 
   def create_resource_managers
     MEMBER_COUNT.times do |n|
-      create(:member, :resource_manager,
+      upsert_seed_member(:member, :resource_manager,
         email:          "rm_member#{n}@test.com",
         firstname:      "Resource",
         lastname:       "Manager#{n}",
@@ -225,6 +240,19 @@ class SeedData
   def create_shops_and_tools
     return if Shop.count > 0
     shop_data = [
+      {
+        name: "Facilities",
+        slack_channel: "facilities",
+        tools: [{
+          name: "Orientation",
+          description: "Orientation is your first step towards active membership, and is available during scheduled Open House hours or by special arrangement",
+          reservable: true,
+          max_concurrent_reservations: 6,
+          reservation_horizon_days: 15,
+          max_reservation_duration_hours: 0.5,
+          allow_pending: true
+        }]
+      },
       { name: "3D Printers",  slack_channel: "shop-3dprinting",  tools: ["Prusa MK4", "Bambu X1C"] },
       { name: "Woodshop",     slack_channel: "shop-woodworking",  tools: ["Table Saw", "Band Saw", "Planer", "Jointer", "Drill Press"] },
       { name: "Metal Shop",   slack_channel: "shop-metalwork",    tools: ["MIG Welder", "TIG Welder", "Angle Grinder", "Metal Lathe"] },
@@ -236,9 +264,17 @@ class SeedData
     ]
     shop_data.each do |s|
       shop = Shop.create!(name: s[:name], slack_channel: s[:slack_channel])
-      s[:tools].each do |t|
-        Tool.create!(name: t, description: "#{t} in #{s[:name]}", shop: shop)
+      s[:tools].each do |tool_data|
+        attributes = tool_data.is_a?(Hash) ? tool_data : {
+          name: tool_data,
+          description: "#{tool_data} in #{s[:name]}"
+        }
+        Tool.create!(attributes.merge(shop: shop))
       end
+    end
+    shop_ids = Shop.all.pluck(:id).map(&:to_s)
+    Member.where(role: "resource_manager").each do |member|
+      member.set(resource_manager_shop_ids: shop_ids)
     end
     puts "  [seed] Created #{Shop.count} shops with #{Tool.count} tools."
   end
@@ -333,6 +369,14 @@ class SeedData
 
   # ── Braintree Subscriptions ───────────────────────────────────────────────
 
+  # Braintree's sandbox rejects bursts of rapid-fire requests with a
+  # Braintree::AuthorizationError (no Retry-After header to guide the delay) --
+  # observed even on an otherwise-idle sandbox account, not just under
+  # concurrent CI runs. Pace our own requests and retry transient rejections
+  # with backoff rather than aborting the whole seed run.
+  BRAINTREE_SEED_PACING = 0.3 # seconds between each member's Braintree calls
+  BRAINTREE_RETRY_DELAYS = [2, 5, 10].freeze # seconds, one retry per entry
+
   def create_subscriptions
     gateway        = Service::BraintreeGateway.connect_gateway
     invoice_option = InvoiceOption.find("one-month")
@@ -346,6 +390,7 @@ class SeedData
         member = Member.find_by(email: "#{prefix}#{n}@test.com")
         if member
           seed_subscription_for(member, invoice_option, gateway, SANDBOX_VISA_NONCE)
+          sleep(BRAINTREE_SEED_PACING)
         else
           puts "  [seed] Warning: #{label} member #{n} not found, skipping subscription."
         end
@@ -353,8 +398,28 @@ class SeedData
     end
   end
 
+  # Retries a Braintree sandbox call that failed with AuthorizationError,
+  # which in practice here means a transient rejection rather than a real
+  # auth problem (the surrounding calls in the same run succeed with the same
+  # credentials). Re-raises after exhausting BRAINTREE_RETRY_DELAYS.
+  def with_braintree_retry(description)
+    attempt = 0
+    begin
+      yield
+    rescue Braintree::AuthorizationError
+      delay = BRAINTREE_RETRY_DELAYS[attempt]
+      raise if delay.nil?
+      attempt += 1
+      puts "  [seed] Braintree::AuthorizationError on #{description} -- retrying in #{delay}s (attempt #{attempt}/#{BRAINTREE_RETRY_DELAYS.size})"
+      sleep(delay)
+      retry
+    end
+  end
+
   def seed_subscription_for(member, invoice_option, gateway, nonce)
-    results           = gateway.customer.search { |s| s.email.is(member.email) }
+    results = with_braintree_retry("customer search for #{member.email}") do
+      gateway.customer.search { |s| s.email.is(member.email) }
+    end
     existing_customer = results.first
     if existing_customer
       active_sub = find_active_subscription(existing_customer)
@@ -375,10 +440,12 @@ class SeedData
       # Creating a fresh customer instead avoids growing that history further.
       puts "  [seed] No active subscription for #{member.fullname} — creating fresh Braintree customer instead of reusing #{existing_customer.id}"
     end
-    result = gateway.customer.create(
-      first_name: member.firstname, last_name: member.lastname,
-      email: member.email, payment_method_nonce: nonce
-    )
+    result = with_braintree_retry("customer create for #{member.email}") do
+      gateway.customer.create(
+        first_name: member.firstname, last_name: member.lastname,
+        email: member.email, payment_method_nonce: nonce
+      )
+    end
     unless result.success?
       puts "  [seed] Warning: Could not create Braintree customer for #{member.fullname}: #{result.message}"
       return
@@ -397,9 +464,14 @@ class SeedData
   end
 
   def reconnect_member(member, customer, subscription, invoice_option)
+    # Braintree's sandbox is external and persists across seed runs (unlike
+    # Mongo/Redis, which are fresh every run) -- a reused subscription's
+    # paid_through_date reflects whenever it last actually billed in the
+    # sandbox, not "now". Trusting it here can leave a freshly-seeded fixture
+    # already expired relative to the current run's wall-clock time.
     member.update!(
       customer_id: customer.id, subscription_id: subscription.id,
-      subscription: true, expirationTime: subscription.paid_through_date.to_time.to_i * 1000
+      subscription: true, expirationTime: (Time.now + invoice_option.quantity.months).to_i * 1000
     )
     Invoice.create!(
       member: member, name: invoice_option.name, description: invoice_option.description,
@@ -419,11 +491,13 @@ class SeedData
       due_date: Time.now + 1.month
     )
     subscription_id = invoice.generate_subscription_id
-    result = gateway.subscription.create(
-      payment_method_token: payment_method_token,
-      plan_id: SANDBOX_PLAN_ID,
-      id: subscription_id
-    )
+    result = with_braintree_retry("subscription create for #{member.email}") do
+      gateway.subscription.create(
+        payment_method_token: payment_method_token,
+        plan_id: SANDBOX_PLAN_ID,
+        id: subscription_id
+      )
+    end
     unless result.success?
       puts "  [seed] Warning: Could not create subscription for #{member.fullname}: #{result.message}"
       return
@@ -850,32 +924,4 @@ class SeedData
 
   # ── Membership Snapshots ──────────────────────────────────────────────────
   #
-  # Generate one snapshot per month for the full history window.
-  # Each snapshot records which member IDs were active at the last day of that month.
-  # Mirrors the logic in the existing rake task.
-
-  def create_membership_snapshots
-    total_months = HISTORY_YEARS * 12
-    count = 0
-
-    total_months.times do |month_offset|
-      snapshot_date = month_offset.months.ago.end_of_month.to_date
-      next if MembershipSnapshot.where(date: snapshot_date).exists?
-
-      snapshot_time_ms = snapshot_date.to_time.to_i * 1000
-
-      active_member_ids = Member.where(
-        :startDate.lte      => snapshot_date.to_time,
-        :expirationTime.gte => snapshot_time_ms
-      ).map { |m| m.id.as_json }
-
-      MembershipSnapshot.create!(
-        date:           snapshot_date,
-        active_members: active_member_ids
-      )
-      count += 1
-    end
-
-    puts "  [seed] Created #{count} monthly membership snapshots (#{MembershipSnapshot.count} total)."
-  end
 end

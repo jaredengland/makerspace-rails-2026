@@ -1,5 +1,8 @@
 class Member
   include Mongoid::Document
+  include MembershipPaidLifecycle
+  include MembershipPaidDeferredEffects
+  field :card_operation_version, type: Integer, default: 0
   include SanitizesUserInput
   include Mongoid::Search
   include ActiveModel::Serializers::JSON
@@ -7,10 +10,37 @@ class Member
   include Service::SlackConnector
   include Publishable
 
+  scope :shop_resource_manager_candidates, -> { where(:role.in => %w[resource_manager admin board_member]) }
+
   # Include default devise modules. Others available are:
   # :confirmable, :lockable and :omniauthable
   devise :database_authenticatable, :registerable,
          :recoverable, :rememberable, :timeoutable, :validatable
+
+  # Devise's :validatable module adds its own unconditional
+  # validates_uniqueness_of(:email) with no knowledge of merged_at -- it ran
+  # independently of (and in addition to) any uniqueness validation written
+  # below, silently blocking a returning member from reusing a soft-deleted
+  # account's email no matter what that other validation did. Remove just
+  # this validator (Devise's presence/format checks stay) in favor of
+  # validate_email_not_taken_by_an_active_member below.
+  # Wrapped defensively: this reaches into ActiveSupport::Callbacks
+  # internals, which have already broken across Rails versions once in this
+  # exact spot. A failure here should degrade to Devise's validator still
+  # (incorrectly) running -- an isolated, debuggable test failure -- rather
+  # than raising at class-load time and taking down every spec/request that
+  # touches Member.
+  begin
+    _validators[:email].reject! { |validator| validator.is_a?(Mongoid::Validatable::UniquenessValidator) }
+    _validate_callbacks.each do |callback|
+      next unless callback.filter.is_a?(Mongoid::Validatable::UniquenessValidator)
+      next unless Array(callback.filter.attributes) == [:email]
+
+      _validate_callbacks.delete(callback)
+    end
+  rescue => error
+    Rails.logger.warn("[Member] Failed to remove Devise's built-in email uniqueness validator: #{error.class}: #{error.message}") if defined?(Rails) && Rails.logger
+  end
 
   # Overrides Devise::Models::Timeoutable#timeout_in so the idle-timeout
   # duration is looked up fresh from SystemConfig on every request, instead
@@ -34,11 +64,14 @@ class Member
   field :address_state
   field :address_postal_code
 
-  field :status,                         default: "activeMember" # activeMember, nonMember, revoked, inactive
+  ACTIVE_MEMBERSHIP_STATUSES = %w[activeMember pending].freeze
+
+  field :status,                         default: "activeMember" # activeMember, pending, nonMember, revoked, inactive
   field :expirationTime,  type: Integer  #pre-calcualted time of expiration
   field :startDate, default: -> { Time.now }
   field :groupName, type: String #potentially member is in a group/partner membership
   field :role,                          default: "member" #admin,board_member,resource_manager,member
+  field :resource_manager_shop_ids, type: Array, default: []
   field :firebase_uid,                   type: String
 
   ## TOTP / Two-Factor Authentication
@@ -63,21 +96,112 @@ class Member
   field :silence_emails, type: Boolean # Stop marketing emails to user
   field :notes, type: String
 
+  # How the member first heard of the makerspace, for conversion metrics (for
+  # example members who came over from a class). Asked as an optional question
+  # at signup and correctable by staff on the member profile. The detail is
+  # free text typed at signup: the class name for "class", the person's name
+  # for "friend". For "friend", staff can also link the actual referring member
+  # (referred_by_member_id) from the profile; it is never offered on the public
+  # signup form, which must not expose the member list.
+  SIGNUP_SOURCES = %w[class walk_in friend website social other eventbrite declined].freeze
+  SIGNUP_SOURCES_WITH_DETAIL = %w[class friend other].freeze
+  field :signup_eventbrite_event_id, type: BSON::ObjectId
+  field :signup_eventbrite_event_snapshot, type: Hash
+  field :signup_source_prompt_pending, type: Boolean, default: false
+  field :signup_source_asked_at, type: Time
+  field :eventbrite_link_pending_at, type: Time
+  index({ eventbrite_link_pending_at: 1 })
+  before_save :mark_eventbrite_link_pending
+  validate :validate_signup_eventbrite_event
+  field :signup_source, type: String
+  field :signup_source_detail, type: String
+  field :referred_by_member_id, type: BSON::ObjectId
+  before_validation :normalize_signup_source
+
+  # External account provisioning is scoped to the member's current email.
+  # AuditLog retains history when these current-state fields are reset.
+  field :provisioning_initialized_at, type: Time
+  field :provisioning_email, type: String
+  field :slack_invite_confirmed_at, type: Time
+  field :slack_invite_source, type: String
+  field :slack_invite_mode, type: String
+  field :slack_acceptance_pending, type: Boolean
+  field :slack_joined_at, type: Time
+  field :slack_full_member_at, type: Time
+  field :slack_manual_action_required, type: String
+  field :slack_last_attempt_at, type: Time
+  field :slack_last_error, type: String
+  field :slack_previous_user_id, type: BSON::ObjectId
+  field :google_resources_access_confirmed_at, type: Time
+  field :google_transfer_access_confirmed_at, type: Time
+  field :google_previous_email, type: String
+  field :google_last_attempt_at, type: Time
+  field :google_last_error, type: String
+  field :google_provisioning_blocked_at, type: Time
+  field :google_provisioning_blocked_reason, type: String
+
+  # Set to the exact expirationTime (ms) a membership-lapse notice was sent
+  # for -- not just a timestamp of when -- so a later renewal (which moves
+  # expirationTime forward) naturally makes this stale and allows a fresh
+  # notice on the member's next expiration, without needing a separate reset.
+  # See Service::MembershipExpirationNotice.
+  field :membership_expiring_soon_notice_sent_for, type: Integer
+  field :membership_expired_notice_sent_for, type: Integer
+  # Service::MemberReminders: how many "come get your fob" / "finish joining" reminders were
+  # sent and when the last went out. Two reminders at most; see the service for the schedule.
+  field :fob_reminder_count,              type: Integer, default: 0
+  field :fob_reminder_last_sent_at,       type: Time
+  field :signup_reminder_count,           type: Integer, default: 0
+  field :signup_reminder_last_sent_at,    type: Time
+
+  # Soft-delete marker for a "ghost" account -- a duplicate signup (e.g. a
+  # member who couldn't access their original account/email and created a
+  # second one) rather than a real membership-lifecycle state like revoked
+  # or inactive. Kept as its own field, deliberately independent of `status`,
+  # so it doesn't interact with membership reporting/analytics or the
+  # expiration-notice job. The record itself is never deleted -- audit
+  # history, invoices, etc. all keep resolving -- it's just excluded from
+  # normal queries by the default_scope below and its email frees up for
+  # reuse. See Service::MemberSoftDelete.
+  field :merged_at, type: Time
+
+  default_scope -> { where(merged_at: nil) }
+
   search_in :email, :lastname
   search_in :firstname, index: :_firstname_keywords
 
   validates :firstname, presence: true
   validates :lastname, presence: true
-  validates :email, uniqueness: true
+  validate :validate_email_not_taken_by_an_active_member
   validates :email, email_deliverability: true, unless: :skip_email_deliverability_validation
   validates :cardID, uniqueness: true, allow_nil: true
-  validates_inclusion_of :status, in: ["activeMember", "nonMember", "revoked", "inactive", "suspended"]
+  validates_inclusion_of :status, in: ["activeMember", "pending", "nonMember", "revoked", "inactive", "suspended"]
   validates_inclusion_of :role, in: ["admin", "board_member", "resource_manager", "member"]
+  # Checked only when changed, so a choice retired from SIGNUP_SOURCES later does
+  # not block saving the members who already have it.
+  validates :signup_source, inclusion: { in: SIGNUP_SOURCES }, allow_nil: true, if: :signup_source_changed?
+  validates :signup_source_detail, length: { maximum: 100 }
+  validate :referrer_is_another_member, if: :referred_by_member_id_changed?
+
+  index({ email: 1 }, {
+    unique: true,
+    partial_filter_expression: { email: { '$type' => 'string' }, merged_at: nil }
+  })
+  index({ customer_id: 1 }, {
+    unique: true,
+    partial_filter_expression: { customer_id: { '$type' => 'string' } }
+  })
+  # Supports the leading status equality and membership interval bounds used
+  # by Service::Analytics::Members.active_members_by_month.
+  index({ status: 1, startDate: 1, expirationTime: 1 })
+  index({ status: 1, expirationTime: 1 })
 
   before_validation :normalize_email, :normalize_group_name
   after_initialize :verify_group_expiry
   after_create :apply_default_permissions, :publish_create
-  after_update :update_card, :handle_successful_email_change, :publish_update, :check_household_exit, :sync_expiration_to_group
+  after_update :handle_reservation_membership_changes, :update_card, :handle_successful_email_change,
+               :publish_update, :check_household_exit, :sync_expiration_to_group,
+               :enqueue_member_provisioning, :enqueue_checkout_canvas_syncs
   after_destroy :publish_destroy
 
   has_many :permissions, class_name: 'Permission', dependent: :destroy, :autosave => true
@@ -97,10 +221,36 @@ class Member
     write_attribute(:groupName, value.present? ? value.to_s : nil)
   end
 
+  # groupName predates the household feature and was also used for a
+  # separate, older concept -- a free-text organizational/partner-group
+  # label (see field comment above) -- so a present groupName that isn't
+  # this member's own id is NOT reliably a household reference. Verifying
+  # a real primary member actually exists at that id is what distinguishes
+  # an actual secondary from a member still carrying one of those old
+  # labels (e.g. "Autodesk", "GSWT") -- those look identical to a stale
+  # secondary reference under the old id.present? && id != self.id check,
+  # which is what caused non-household members to see household-member
+  # messaging in their self-service portal.
   def household_role
     return nil unless groupName.present?
     return :primary if self.id.to_s == groupName.to_s
-    :secondary
+    return :secondary if Member.where(id: groupName).exists?
+    nil
+  end
+
+  # True when a member is billed on a household membership plan but is not yet
+  # part of a household (neither its primary nor a secondary). This is the state
+  # that needs an admin to create the household and attach the second adult.
+  # Uses the same "latest member invoice plan includes household" test that
+  # Admin::GroupsController#create requires before a household can be made.
+  # Expired memberships are excluded: they are not being onboarded or renewed.
+  def household_setup_needed?
+    return false if household_role.present?
+    return false unless active_membership_status?
+    return false if expirationTime.present? && expirationTime <= (Time.now.to_i * 1000)
+
+    latest = Invoice.where(resource_class: "member", resource_id: id.to_s).order_by(created_at: :desc).first
+    latest&.plan_id.to_s.include?("household")
   end
 
   def direct_notifications_suppressed?
@@ -115,6 +265,31 @@ class Member
 
   # Searches members using Atlas $search if available, falls back to case-insensitive
   # regex queries for local/CI environments where Atlas Search is not supported.
+  # Explicit ID lookups (admin detail pages, restoring a soft-deleted
+  # account, background jobs resolving a stored member_id, etc.) must find a
+  # member regardless of merged_at -- only ordinary listing/search queries
+  # should respect the default_scope above. Mirrors SlackUser's identical
+  # override for the same reason.
+  def self.find(*ids)
+    unscoped.find(*ids)
+  end
+
+  # A member is only eligible for soft-delete ("ghost" cleanup) when they
+  # have no live Braintree subscription -- even one not yet reflected in
+  # status/expirationTime -- and are not currently an active member with a
+  # live, unexpired term. `status` defaults to "activeMember" for every new
+  # signup regardless of whether it ever really started, so a blank
+  # expirationTime (no fob ever registered, no term to interrupt) counts as
+  # eligible here too -- that's the common shape of exactly the duplicate/
+  # abandoned signup this exists to clean up, not an active member with a
+  # future expiration.
+  def eligible_for_soft_delete?
+    return false if active_membership_subscription?
+    return true unless active_membership_status?
+
+    expirationTime.blank? || expirationTime <= (Time.current.to_i * 1000)
+  end
+
   # Regex.escape prevents special characters from breaking the query.
   # Returns Mongoid criteria matching members by full name "Firstname Lastname"
   # Used as fallback when Atlas Search is unavailable (local/CI).
@@ -155,6 +330,7 @@ class Member
             }
           }
         },
+        { :$match => criteria.selector },
         {
           :$sort => {
             score: { :$meta => "searchScore" }
@@ -192,6 +368,7 @@ class Member
             }
           },
         },
+        { :$match => criteria.selector },
         {
           :$sort => {
             score: { :$meta => "searchScore" }
@@ -229,15 +406,167 @@ class Member
   end
 
   def active_unexpired?
+    active_membership_status? && expirationTime.present? && expirationTime > (Time.now.to_i * 1000)
+  end
+
+  def active_membership_status?
+    ACTIVE_MEMBERSHIP_STATUSES.include?(status)
+  end
+
+  def fully_active_unexpired?
     status == 'activeMember' && expirationTime.present? && expirationTime > (Time.now.to_i * 1000)
+  end
+
+  def provisioning_eligible?
+    expirationTime.present? &&
+      expirationTime > (Time.current.to_i * 1000) &&
+      !%w[revoked inactive].include?(status) &&
+      access_cards.any? { |card| !%w[lost stolen].include?(card.validity) }
+  end
+
+  def provisioning_email_current?
+    provisioning_email.present? &&
+      provisioning_email.to_s.strip.downcase == email.to_s.strip.downcase
+  end
+
+  def matching_slack_user
+    normalized_email = email.to_s.strip.downcase
+    return nil if normalized_email.blank?
+
+    SlackUser.where(slack_email: /\A#{Regexp.escape(normalized_email)}\z/i).first
+  end
+
+  def membership_expires_at
+    return nil if expirationTime.blank?
+    Time.at(expirationTime.to_f / 1000).utc
+  end
+
+  def active_membership_subscription?
+    return true if subscription == true || subscription_id.present?
+    household = group
+    household.present? && (household.subscription == true || household.subscription_id.present?)
+  rescue Mongoid::Errors::DocumentNotFound
+    false
+  end
+
+  def deliverable_email?
+    return false if email.blank?
+
+    latest_event = MailtrapEvent.where(email: email.to_s.downcase)
+      .order_by(occurred_at: :desc, created_at: :desc)
+      .first
+    return true if latest_event.nil?
+
+    disposition = [latest_event.status, latest_event.event, latest_event.response]
+      .compact.join(" ").downcase
+    disposition.exclude?("bounce") &&
+      disposition.exclude?("reject") &&
+      disposition.exclude?("complaint") &&
+      disposition.exclude?("spam") &&
+      disposition.exclude?("failed")
+  rescue => error
+    Rails.logger.warn(
+      "[EmailDeliverabilityLookup] member_id=#{id} error=#{error.class}: #{error.message}"
+    )
+    false
+  end
+
+  # Volunteers (open house staff) who hold an active, unexpired checkout on the tool
+  # flagged `grants_fob_issuance` may issue first key fobs. The tool is configured by
+  # admin/board, so its prerequisites (orientation, tour guide) are enforced by the
+  # normal checkout approval flow, and revoking or expiring the checkout removes the
+  # ability.
+  def fob_issuer?
+    return false unless fully_active_unexpired?
+    tool_ids = Tool.where(grants_fob_issuance: true).pluck(:id)
+    return false if tool_ids.empty?
+    ToolCheckout.where(member_id: id, :tool_id.in => tool_ids, revoked_at: nil, superseded_by_id: nil)
+      .to_a.any?(&:active?)
+  end
+
+  # True when the member has no access card that is still usable (lost and stolen
+  # cards do not count). Fob issuers may only issue to such members.
+  def awaiting_first_fob?
+    access_cards.none? { |card| !%w[lost stolen].include?(card.validity) }
   end
 
   def valid_for_checkout_request?
     active_unexpired? && member_contract_signed_date.present?
   end
 
+  def manages_shop?(shop_or_id)
+    role == "resource_manager" &&
+      Array(resource_manager_shop_ids).map(&:to_s).include?(shop_or_id.try(:id).to_s.presence || shop_or_id.to_s)
+  end
+
+  # Roles that can be tagged as a shop's point-of-contact via
+  # resource_manager_shop_ids. An admin or board member already has blanket
+  # management authority everywhere (see can_manage_shop?/manages_shop?
+  # above, which stay resource_manager-only on purpose) -- this tagging is
+  # purely about who gets LISTED as the contact for a specific shop (e.g. on
+  # the public workshop page, or in a shop's volunteer Slack canvas), since
+  # in practice that's often an admin or board member wearing a second hat
+  # rather than someone whose only role is resource_manager.
+  RESOURCE_MANAGER_TAGGABLE_ROLES = %w[admin board_member resource_manager].freeze
+
+  def self.tagged_resource_managers_for_shop(shop_or_id)
+    shop_id = shop_or_id.try(:id).to_s.presence || shop_or_id.to_s
+    where(:role.in => RESOURCE_MANAGER_TAGGABLE_ROLES, :resource_manager_shop_ids.in => [shop_id])
+  end
+
+  def handle_reservation_membership_changes
+    return if defer_paid_membership_effect { handle_reservation_membership_changes }
+    cleanup_type = if previous_changes["status"]&.first != "revoked" && status == "revoked"
+      "revoked"
+    elsif membership_subscription_ended? && !active_membership_subscription?
+      "subscription_ended"
+    end
+    return if cleanup_type.nil?
+
+    if cleanup_type == "revoked"
+      ReservationLifecycleService.cancel_current_and_future!(
+        self,
+        reason: "Membership was revoked"
+      )
+    else
+      ReservationLifecycleService.cancel_beyond_membership!(
+        self,
+        reason: "Recurring membership was cancelled"
+      )
+    end
+  rescue => error
+    Rails.logger.error(
+      "[ReservationCleanup] member_id=#{id} type=#{cleanup_type} " \
+      "error=#{error.class}: #{error.message}"
+    )
+    Honeybadger.notify(error) if defined?(Honeybadger)
+    ReservationMembershipCleanupJob.perform_later(id.to_s, cleanup_type) if cleanup_type
+  end
+
+  def membership_subscription_ended?
+    subscription_change = previous_changes["subscription"]
+    subscription_id_change = previous_changes["subscription_id"]
+    (subscription_change&.first == true && subscription != true) ||
+      (subscription_id_change&.first.present? && subscription_id.blank?)
+  end
+
   def normalize_email
     self.email = self.email.to_s.strip.downcase
+  end
+
+  # A plain `uniqueness: { conditions: -> { ... } }` validation option isn't
+  # reliably honored here (verified against Mongoid 8.1.12 -- the check
+  # still fires against a merged_at member), so this is spelled out
+  # explicitly instead: excludes soft-deleted ("ghost") members from the
+  # uniqueness check, both from Member's own default_scope (bypassed via
+  # unscoped, matching the real Mongo partial index below) and by requiring
+  # merged_at: nil directly. The real enforcement is that Mongo index --
+  # this is just the friendly pre-save error message.
+  def validate_email_not_taken_by_an_active_member
+    return if email.blank?
+
+    conflict = Member.unscoped.where(email: email, merged_at: nil).where(:id.ne => id).exists?
+    errors.add(:email, :taken) if conflict
   end
 
   def normalize_group_name
@@ -319,10 +648,10 @@ class Member
     now_ms    = Time.now.to_i * 1000
     lapsed    = expirationTime.nil? ||
                 expirationTime < now_ms ||
-                status != 'activeMember'
+                !active_membership_status?
     return unless lapsed
 
-    member_url = "#{Rails.configuration.action_mailer.default_url_options[:host]}/members/#{id}"
+    member_url = "#{Rails.configuration.x.app_base_url}/members/#{id}"
     rental_list = orphaned.map { |r| "##{r.number}" }.join(', ')
 
     ::Service::SlackConnector.send_slack_message(
@@ -332,7 +661,7 @@ class Member
       ::Service::SlackConnector.members_relations_channel
     )
   rescue => e
-    Honeybadger.notify(e) if defined?(Honeybadger)
+    Service::ErrorReporter.notify(e)
   end
 
   def get_permissions
@@ -360,8 +689,41 @@ class Member
     end
   end
 
+  # Statuses a processed membership payment lifts back to activeMember. revoked and
+  # suspended are deliberate staff decisions, so a payment never changes them.
+  REACTIVATED_BY_PAYMENT = %w[inactive nonMember].freeze
+
+  # Called when a membership payment is processed, whether it is applied now or held
+  # until the first fob. Mirrors Card#activate_pending_member: an atomic status write
+  # (no validations or callbacks), then the work the status change would have queued.
+  def reactivate_for_payment!
+    return false unless REACTIVATED_BY_PAYMENT.include?(status)
+
+    previous_status = status
+    set(status: 'activeMember')
+    # With a fob the renewal that follows saves the expiration, and that save queues both of
+    # these. With no fob the payment is only held, so nothing else will.
+    if access_cards.none?
+      MembershipPaidCredit.after_commit do
+        MemberProvisioningJob.perform_later(id.to_s)
+        Service::ToolCheckoutSlackCanvas.enqueue_for_members([id])
+      end
+    end
+    Service::AuditLogger.log(
+      log_type:        'member',
+      event_type:      'member_reactivated_by_payment',
+      resource_type:   'Member',
+      resource_id:     id,
+      subject:         self,
+      field_changes:   { 'status' => [previous_status, 'activeMember'] },
+      message_details: "A membership payment was processed for a member whose status was #{previous_status}."
+    )
+    true
+  end
+
   # Emit to Member & Management channels on renewal
   def send_renewal_slack_message(current_user=nil)
+    return if defer_paid_membership_effect { send_renewal_slack_message(current_user) }
     slack_user = SlackUser.find_by(member_id: id)
     # NOTE: enque_message's default uniquifier is derived only from the
     # calling method name + Current.request_id — both calls below happen
@@ -385,6 +747,7 @@ class Member
 
   # Emit to Member & Management channels on renewal reversals
   def send_renewal_reversal_slack_message
+    return if defer_paid_membership_effect { send_renewal_reversal_slack_message }
     slack_user = SlackUser.find_by(member_id: id)
     unless slack_user.nil?
       enque_message(
@@ -409,6 +772,8 @@ class Member
     :expirationTime
   end
 
+  public
+
   # Devise hook — prevents revoked/suspended members from signing in.
   def active_for_authentication?
     super && !%w[revoked suspended].include?(status)
@@ -426,7 +791,53 @@ class Member
   private
   def update_card
     self.access_cards.each do |c|
+      # This save is a side effect of our own after_update chain, which
+      # already enqueues MemberProvisioningJob below (see
+      # enqueue_member_provisioning) whenever expirationTime/email/status
+      # changes. Without this guard, Card's own after_update callback would
+      # enqueue a second, redundant job for the same member for every card
+      # they hold -- confirmed happening on every subscription renewal.
+      c.skip_provisioning_enqueue = true
       c.update(expiry: self.expirationTime)
+    end
+  end
+
+  # Blank answers (an unanswered dropdown) are stored as nil. The typed name is
+  # kept only for the sources that ask for one, and the linked referrer only for
+  # "friend", so changing the source cannot leave stale details behind.
+  def normalize_signup_source
+    self.signup_source = signup_source.presence
+    self.signup_source_detail = signup_source_detail.presence
+    self.signup_source_detail = nil unless SIGNUP_SOURCES_WITH_DETAIL.include?(signup_source)
+    self.referred_by_member_id = nil unless signup_source == "friend"
+  end
+
+  def mark_eventbrite_link_pending
+    self.eventbrite_link_pending_at = Time.current if new_record? || email_changed? || merged_at_changed?
+  end
+
+  def validate_signup_eventbrite_event
+    if signup_source != 'eventbrite'
+      self.signup_eventbrite_event_id = nil
+      self.signup_eventbrite_event_snapshot = nil
+      return
+    end
+    return unless new_record? || signup_source_changed? || signup_eventbrite_event_id_changed?
+    event = EventbriteEvent.signup_choices.where(id: signup_eventbrite_event_id).first
+    unless event
+      errors.add(:signup_eventbrite_event_id, 'is no longer available. Choose another answer or skip this question.')
+      return
+    end
+    self.signup_eventbrite_event_snapshot = { 'name' => event.name, 'startsAt' => event.starts_at.iso8601, 'timezone' => event.timezone }
+  end
+
+  def referrer_is_another_member
+    return if referred_by_member_id.blank?
+
+    if referred_by_member_id == id
+      errors.add(:referred_by_member_id, "cannot be the member themself")
+    elsif !Member.where(id: referred_by_member_id).exists?
+      errors.add(:referred_by_member_id, "must be an existing member")
     end
   end
 
@@ -438,7 +849,19 @@ class Member
     group = Group.find_by(groupName: groupName)
     return unless group
 
+    before = self.attributes.dup
     group.remove_subordinate(self)
+    ::Service::AuditLogger.log(
+      log_type:        "member",
+      event_type:      "household_exit_auto",
+      resource_type:   "Member",
+      resource_id:     self.id,
+      subject:         self,
+      field_changes:   self.previous_changes,
+      before_snapshot: before,
+      after_snapshot:  self.attributes,
+      message_details: "Member started their own subscription and was automatically removed from the household"
+    )
   end
 
   def sync_expiration_to_group
@@ -477,6 +900,7 @@ class Member
   end
 
   def cancel_active_household_subscription(group)
+    return if defer_paid_membership_effect { cancel_active_household_subscription(group) }
     return unless group.subscription_id.present?
 
     gateway = ::Service::BraintreeGateway.connect_gateway
@@ -484,25 +908,31 @@ class Member
   end
 
   def notify_household_disbanded(members)
+    return if defer_paid_membership_effect { notify_household_disbanded(members) }
     members.each do |member|
       primary = member.id == self.id
-      message = if primary
-                  "Your Manchester Makerspace household membership has been disbanded because your account was renewed with an individual membership plan."
-                else
-                  "Your Manchester Makerspace household membership has been disbanded because the primary household member renewed with an individual membership plan. Please elect a new membership plan before your current expiration date."
-                end
+      template = primary ? :household_disbanded_primary : :household_disbanded_secondary
+      message = ::Service::EmailTemplate.render(
+        template,
+        ::Service::EmailTemplate.common_variables(member).merge(primary_member_name: fullname),
+        fallback: true,
+        format: :text
+      )
 
       slack_user = SlackUser.find_by(member_id: member.id)
       ::Service::SlackConnector.send_slack_message(message, slack_user.slack_id) if slack_user
       MemberMailer.household_disbanded(member.id.to_s, self.id.to_s, primary).deliver_later
     end
 
-    ::Service::SlackConnector.send_slack_message(
-      "#{fullname}'s household membership was disbanded after renewal with an individual membership plan.",
-      ::Service::SlackConnector.members_relations_channel
+    message = ::Service::EmailTemplate.render(
+      :household_disbanded_admin,
+      ::Service::EmailTemplate.common_variables(self),
+      fallback: true,
+      format: :text
     )
+    ::Service::SlackConnector.send_slack_message(message, ::Service::SlackConnector.members_relations_channel)
   rescue => e
-    Honeybadger.notify(e) if defined?(Honeybadger)
+    Service::ErrorReporter.notify(e)
   end
 
   def benefits_from_group
@@ -529,13 +959,80 @@ class Member
   end
 
   def publish_update
-    publish(:billing_info_changed) if previous_changes.keys.any? { |attr| [:firstname, :lastname].include?(attr.to_sym) }
+    return if defer_paid_membership_effect { publish_update }
+    publish(:billing_info_changed) if previous_changes.keys.any? { |attr| [:firstname, :lastname, :email].include?(attr.to_sym) }
   end
 
   def handle_successful_email_change
+    return if defer_paid_membership_effect { handle_successful_email_change }
     return unless previous_changes.key?("email")
 
-    set(firebase_uid: nil, session_token: SecureRandom.hex)
+    previous_email = previous_changes["email"].first.to_s.strip.downcase.presence
+    previous_slack_user = if previous_email.present?
+      SlackUser.where(
+        member_id: id,
+        slack_email: /\A#{Regexp.escape(previous_email)}\z/i
+      ).first || SlackUser.where(member_id: id).first
+    end
+
+    set(
+      firebase_uid: nil,
+      session_token: SecureRandom.hex,
+      provisioning_initialized_at: Time.current,
+      provisioning_email: email.to_s.strip.downcase,
+      slack_invite_confirmed_at: nil,
+      slack_invite_source: nil,
+      slack_invite_mode: nil,
+      slack_acceptance_pending: nil,
+      slack_joined_at: nil,
+      slack_full_member_at: nil,
+      slack_manual_action_required: "invite",
+      slack_last_attempt_at: nil,
+      slack_last_error: "Member email changed; manual reprovisioning is required",
+      slack_previous_user_id: slack_previous_user_id.presence || previous_slack_user&.id,
+      google_resources_access_confirmed_at: nil,
+      google_transfer_access_confirmed_at: nil,
+      google_previous_email: google_previous_email.presence || previous_email,
+      google_last_attempt_at: nil,
+      google_last_error: nil
+    )
+    notify_slack_reinvite_needed(previous_email)
+  end
+
+  # The Slack step after an email change is manual (the old Slack account is only
+  # deactivated when staff re-invite), so tell the admin channel rather than
+  # leaving a small red icon on the profile that nobody may look at. Skipped for
+  # members Slack provisioning is blocked for (not active, or expired).
+  def notify_slack_reinvite_needed(previous_email)
+    return unless active_membership_status?
+    return if expirationTime.present? && expirationTime <= (Time.current.to_i * 1000)
+
+    ::Service::AuditLogger.log(
+      log_type: "member",
+      event_type: "slack_manual_invite_required",
+      resource_type: "Member",
+      resource_id: id,
+      subject: self,
+      message_details: "Email changed from #{previous_email} to #{email}. Slack needs a manual re-invite: use the " \
+        "Slack button on their profile (it deactivates their old Slack account and invites the new address).",
+      slack_channel: ::Service::SlackConnector.admin_channel
+    )
+  rescue StandardError => e
+    Rails.logger.error("[Member] could not announce the Slack re-invite needed for #{id}: #{e.class} #{e.message}")
+  end
+
+  def enqueue_member_provisioning
+    return if defer_paid_membership_effect { enqueue_member_provisioning }
+    return unless previous_changes.keys.any? { |key| %w[email expirationTime status].include?(key.to_s) }
+
+    MemberProvisioningJob.perform_later(id.to_s)
+  end
+
+  def enqueue_checkout_canvas_syncs
+    return if defer_paid_membership_effect { enqueue_checkout_canvas_syncs }
+    return unless previous_changes.keys.any? { |key| %w[expirationTime status].include?(key.to_s) }
+
+    Service::ToolCheckoutSlackCanvas.enqueue_for_members([id])
   end
 
   def publish_destroy

@@ -15,7 +15,10 @@ FactoryBot.define do
     lastname {generate(:lastname)}
     expirationTime {generate(:expiry)}
     email {generate(:email)}
-    encrypted_password { BCrypt::Password.create('password') }
+    encrypted_password do
+      cost = Rails.env.test? ? BCrypt::Engine::MIN_COST : BCrypt::Engine.cost
+      BCrypt::Password.create('password', cost: cost)
+    end
     member_contract_signed_date { Date.today }
     status { 'activeMember' }
     phone { "992001234" }
@@ -182,7 +185,10 @@ FactoryBot.define do
   end
 
   factory :earned_membership_with_reports, :parent => :earned_membership do
-    after(:build) do |earned_membership|
+    # Must run after(:create), not after(:build) -- the parent factory's
+    # after(:create) hook is what adds requirements, and report_with_report_requirements
+    # needs those to already exist (it maps over earned_membership.requirements).
+    after(:create) do |earned_membership|
       FactoryBot.create_list(:report_with_report_requirements, 2, earned_membership: earned_membership)
     end
   end
@@ -418,6 +424,69 @@ FactoryBot.define do
     after(:build) do |mailtrap_event, evaluator|
       mailtrap_event.member_id ||= evaluator.member.id
     end
+  end
+
+  factory :shop do
+    sequence(:name) { |n| "Shop #{n}" }
+    disabled { false }
+    reservable { true }
+    max_concurrent_reservations { 1 }
+    reservation_horizon_days { 7 }
+    max_reservation_duration_hours { 8 }
+  end
+
+  factory :tool do
+    sequence(:name) { |n| "Tool #{n}" }
+    association :shop
+    disabled { false }
+    reservable { true }
+    max_concurrent_reservations { 1 }
+    reservation_horizon_days { 7 }
+    max_reservation_duration_hours { 8 }
+  end
+
+  factory :location do
+    sequence(:name) { |n| "Location #{n}" }
+    association :shop
+  end
+
+  factory :tool_checkout do
+    association :member
+    association :tool
+    checked_out_at { Time.current }
+  end
+
+  factory :checkout_approver do
+    association :member
+    shop_ids { [] }
+    tool_ids { [] }
+  end
+
+  factory :checkout_approver_request do
+    association :member
+    association :tool
+    status { "open" }
+  end
+
+  factory :reservation do
+    association :member
+    association :shop
+    title { "Project time" }
+    reservation_scope { "shop" }
+    tool_ids { [] }
+    start_at { 1.day.from_now.change(min: 0, sec: 0) }
+    end_at { 1.day.from_now.change(min: 0, sec: 0) + 1.hour }
+    status { "approved" }
+  end
+
+  factory :reservation_blackout do
+    association :shop
+    association :created_by, factory: [:member, :current]
+    title { "Open House" }
+    recurrence { "weekly" }
+    weekday { 1 }
+    start_time { "17:00" }
+    end_time { "20:00" }
   end
 
   factory :dispute_notification, parent: :notification do

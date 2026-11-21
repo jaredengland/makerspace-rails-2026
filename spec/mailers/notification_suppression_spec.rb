@@ -32,6 +32,63 @@ RSpec.describe 'notification suppression', type: :mailer do
       primary = create(:member)
       secondary = create(:member, groupName: primary.id.to_s)
 
+      message = described_class.membership_expiring_soon(secondary.id.to_s).deliver_now
+
+      expect(message.perform_deliveries).to be(false)
+    end
+
+    describe 'soft-deleted members' do
+      let(:deleted) { create(:member, status: 'inactive', expirationTime: nil) }
+
+      before { deleted.update_attribute(:merged_at, Time.current) }
+
+      it 'does not send non-marketing mail, even though the mailer still finds them by id' do
+        message = described_class.request_document('member_contract', deleted.id.to_s).deliver_now
+
+        expect(message.to).to eq([deleted.email])
+        expect(message.perform_deliveries).to be(false)
+      end
+
+      it 'does not send a mail queued before they were deleted' do
+        message = described_class.membership_expiring_soon(deleted.id.to_s).deliver_now
+
+        expect(message.perform_deliveries).to be(false)
+      end
+
+      it 'sends to a live member who has since taken over the same address, since a delete frees the email' do
+        replacement = create(:member, email: deleted.email)
+
+        message = described_class.request_document('member_contract', replacement.id.to_s).deliver_now
+
+        expect(message.to).to eq([deleted.email])
+        expect(message.perform_deliveries).to be(true)
+      end
+
+      it 'sends again once the account is restored' do
+        deleted.update_attribute(:merged_at, nil)
+
+        message = described_class.request_document('member_contract', deleted.id.to_s).deliver_now
+
+        expect(message.perform_deliveries).to be(true)
+      end
+    end
+
+    it 'sends document requests to secondary household members, who need a signed contract to request checkouts' do
+      primary = create(:member)
+      secondary = create(:member, groupName: primary.id.to_s)
+
+      %w[member_contract rental_agreement].each do |document_type|
+        message = described_class.request_document(document_type, secondary.id.to_s).deliver_now
+
+        expect(message.perform_deliveries).to be(true)
+        expect(message.to).to eq([secondary.email])
+      end
+    end
+
+    it 'does not send document requests to a revoked secondary member' do
+      primary = create(:member)
+      secondary = create(:member, groupName: primary.id.to_s, status: 'revoked')
+
       message = described_class.request_document('member_contract', secondary.id.to_s).deliver_now
 
       expect(message.perform_deliveries).to be(false)
@@ -46,7 +103,7 @@ RSpec.describe 'notification suppression', type: :mailer do
       expect(message.perform_deliveries).to be(true)
     end
 
-    xit 'sends password changed security notices to secondary household members' do
+    it 'sends password changed security notices to secondary household members' do
       primary = create(:member)
       secondary = create(:member, groupName: primary.id.to_s)
 
@@ -71,6 +128,46 @@ RSpec.describe 'notification suppression', type: :mailer do
       message = described_class.send_document('member_contract', secondary.id.to_s, 'signed pdf content').deliver_now
 
       expect(message.perform_deliveries).to be(true)
+    end
+
+    describe 'contract update notices (#127)' do
+      before do
+        allow(Service::GoogleDrive).to receive(:get_document_name).and_return('Code of Conduct - Test')
+        allow(Service::GoogleDrive).to receive(:generate_document_string).and_return('pdf-bytes')
+      end
+
+      it 'sends them to secondary household members, who are bound by the same terms' do
+        primary = create(:member)
+        secondary = create(:member, groupName: primary.id.to_s)
+
+        message = described_class.contract_updated(secondary.id.to_s).deliver_now
+
+        expect(message.perform_deliveries).to be(true)
+        expect(message.to).to eq([secondary.email])
+        expect(message.attachments.map(&:filename)).to include('Code of Conduct - Test.pdf')
+      end
+
+      it 'still sends them to primary and independent members' do
+        primary = create(:member)
+        create(:member, groupName: primary.id.to_s)
+        independent = create(:member)
+
+        [primary, independent].each do |member|
+          expect(described_class.contract_updated(member.id.to_s).deliver_now.perform_deliveries).to be(true)
+        end
+      end
+
+      it 'does not send them to a revoked or suspended secondary member' do
+        primary = create(:member)
+
+        %w[revoked suspended].each do |status|
+          secondary = create(:member, groupName: primary.id.to_s, status: status)
+
+          message = described_class.contract_updated(secondary.id.to_s).deliver_now
+
+          expect(message.perform_deliveries).to be(false)
+        end
+      end
     end
   end
 

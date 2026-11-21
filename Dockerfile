@@ -10,10 +10,21 @@ WORKDIR /react
 
 RUN git clone --branch ${REACT_BRANCH} ${REACT_REPO_URL} .
 
+# Async bundles must have deployment-specific URLs.  The Rails entrypoint is
+# fingerprinted by Sprockets, but webpack loads its lazy route bundles directly
+# from /assets; stable chunk names can therefore mix modules from two releases
+# in a browser or CDN cache.
+RUN sed -i \
+      -e 's/makerspace-react\.\[name\]\.js/makerspace-react.[name].[contenthash].js/g' \
+      -e 's/makerspace-react\.\[name\]\.css/makerspace-react.[name].[contenthash].css/g' \
+      prod.config.js && \
+    grep -Fq 'chunkFilename: "makerspace-react.[name].[contenthash].js"' prod.config.js && \
+    grep -Fq 'chunkFilename: `makerspace-react.[name].[contenthash].css`' prod.config.js
+
 RUN yarn install --ignore-engines && PORT=3000 yarn build
 
 # Build backend
-FROM ruby:3.4-bullseye
+FROM ruby:3.4-bookworm
 
 WORKDIR /app
 
@@ -21,9 +32,10 @@ EXPOSE 3000
 
 # Install MongoDB Database Tools (provides mongodump for backups)
 RUN apt-get update -qq && \
-    apt-get install -y -qq wget gnupg && \
-    wget -qO - https://www.mongodb.org/static/pgp/server-7.0.asc | apt-key add - && \
-    echo "deb [ arch=amd64,arm64 ] https://repo.mongodb.org/apt/debian bullseye/mongodb-org/7.0 main" | tee /etc/apt/sources.list.d/mongodb-org-7.0.list && \
+    apt-get install -y -qq ca-certificates curl gnupg && \
+    curl -fsSL https://www.mongodb.org/static/pgp/server-7.0.asc | \
+      gpg --dearmor -o /usr/share/keyrings/mongodb-server-7.0.gpg && \
+    echo "deb [ arch=amd64,arm64 signed-by=/usr/share/keyrings/mongodb-server-7.0.gpg ] https://repo.mongodb.org/apt/debian bookworm/mongodb-org/7.0 main" > /etc/apt/sources.list.d/mongodb-org-7.0.list && \
     apt-get update -qq && \
     apt-get install -y -qq mongodb-database-tools && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
@@ -48,4 +60,7 @@ COPY --from=ui /react/dist/manifest.js /app/app/assets/config/manifest.js
 RUN SECRET_KEY_BASE_DUMMY=1 APP_DOMAIN=${APP_DOMAIN} bundle exec rails assets:precompile
 RUN cp -r /app/app/assets/builds/. /app/public/assets/ && rm -f /app/public/assets/manifest.js
 
-CMD ["bundle", "exec", "rails", "server", "-b", "0.0.0.0"]
+# Keep database maintenance out of web dyno startup. Heroku runs it as the
+# release process declared in heroku.yml, so a transient database failure does
+# not put every web dyno into a crash loop.
+CMD ["bundle", "exec", "puma", "-C", "config/puma.rb"]

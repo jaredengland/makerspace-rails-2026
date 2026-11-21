@@ -14,7 +14,7 @@ class Billing::TransactionsController < BillingController
 
       if transaction_params[:invoice_id]
         invoice = Invoice.find(transaction_params[:invoice_id])
-        raise ::Mongoid::Errors::DocumentNotFound.new(Invoice, { id: transaction_params[:invoice_id] }) if invoice.nil?
+        raise ::Mongoid::Errors::DocumentNotFound.new(Invoice, { id: transaction_params[:invoice_id] }) if invoice.nil? || invoice.member_id != current_member.id
       else 
         invoice_option = InvoiceOption.find(transaction_params[:invoice_option_id])
         raise ::Mongoid::Errors::DocumentNotFound.new(InvoiceOption, { id: transaction_params[:invoice_option_id] }) if invoice_option.nil?
@@ -41,6 +41,7 @@ class Billing::TransactionsController < BillingController
         subject:        invoice.member,
         after_snapshot: { invoice_id: invoice.id.to_s, amount: invoice.amount,
                           plan_id: invoice.plan_id, resource_class: invoice.resource_class },
+        message_details: "Braintree invoice ID: #{invoice.id}, resource class: #{invoice.resource_class}",
         slack_channel:  ::Service::SlackConnector.logs_channel
       )
 
@@ -50,7 +51,7 @@ class Billing::TransactionsController < BillingController
     def index
       # Can only view transactions for your own invoices
       # Transactions & Invoices are stored on different servers so we need to pull both in
-      transactions = ::BraintreeService::Transaction.get_transactions(@gateway, construct_query)
+      transactions = ::BraintreeService::Transaction.get_transactions(@gateway, construct_query, transaction_limit)
 
       return render_with_total_items(transactions, { each_serializer: BraintreeService::TransactionSerializer, adapter: :attributes })
     end
@@ -73,6 +74,7 @@ class Billing::TransactionsController < BillingController
         subject:        invoice.member,
         after_snapshot: { transaction_id: transaction.id, amount: invoice.amount,
                           description: description },
+        message_details: "Braintree invoice ID: #{invoice.id}, resource class: #{invoice.resource_class}",
         slack_channel:  ::Service::SlackConnector.logs_channel
       )
 
@@ -105,6 +107,14 @@ class Billing::TransactionsController < BillingController
           search.created_at <= transaction_query_params[:end_date]
         end
 
+        if transaction_query_params[:min_amount] && transaction_query_params[:max_amount]
+          search.amount.between(transaction_query_params[:min_amount], transaction_query_params[:max_amount])
+        elsif transaction_query_params[:min_amount]
+          search.amount >= transaction_query_params[:min_amount]
+        elsif transaction_query_params[:max_amount]
+          search.amount <= transaction_query_params[:max_amount]
+        end
+
         if transaction_query_params[:refund]
           if transaction_query_params[:type].nil?
             raise ::Error::UnprocessableEntity.new("Type required with refund search")
@@ -121,6 +131,20 @@ class Billing::TransactionsController < BillingController
     end
 
     def transaction_query_params
-      params.permit(:start_date, :end_date, :refund, :type, :transaction_status => [], :payment_method_token => [])
+      # The React client sends camelCase minAmount/maxAmount via a raw request
+      # helper that bypasses the generated API client's snake_case conversion.
+      # Accept both spellings so the filter doesn't silently no-op.
+      query_params = params.permit(:start_date, :end_date, :refund, :type, :min_amount, :max_amount, :minAmount, :maxAmount, :limit, :transaction_status => [], :payment_method_token => [])
+      query_params[:min_amount] ||= query_params.delete(:minAmount)
+      query_params[:max_amount] ||= query_params.delete(:maxAmount)
+      query_params
+    end
+
+    def transaction_limit
+      Integer(transaction_query_params[:limit] || 50).tap do |limit|
+        raise ::Error::UnprocessableEntity.new("Limit must be a positive integer") unless limit.positive?
+      end
+    rescue ArgumentError, TypeError
+      raise ::Error::UnprocessableEntity.new("Limit must be a positive integer")
     end
   end

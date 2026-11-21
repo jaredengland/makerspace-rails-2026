@@ -9,6 +9,9 @@ class VolunteerCredit
   field :member_id,     type: BSON::ObjectId
   field :issued_by_id,  type: BSON::ObjectId
   field :task_id,       type: BSON::ObjectId, default: nil
+  # Restricted provenance: never expose this mapping through general credit APIs.
+  field :ticket_id, type: FixTicketId
+  field :tool_checkout_id, type: BSON::ObjectId, default: nil
 
   # Credit details
   field :description,   type: String
@@ -34,6 +37,15 @@ class VolunteerCredit
   field :reversal_of_id,  type: BSON::ObjectId, default: nil
   field :reversal_reason, type: String,          default: nil
 
+  # Set once at creation from whether the member had an active earned
+  # membership at that exact moment -- permanent regardless of later
+  # suspend/reactivate. Excludes the credit from ever counting toward a
+  # Braintree discount (see check_discount_threshold!), even after the
+  # member converts to a paid subscription; it still counts everywhere else
+  # (lifetime/year/rolling totals), so it's fully available to e.g. future
+  # gamification. See #257.
+  field :earned_while_em_active, type: Boolean, default: false
+
   validates :member_id,    presence: true
   validates :description,  presence: true
   validates :credit_value, numericality: { other_than: 0 }  # 0 invalid; negative allowed for reversal records
@@ -41,9 +53,14 @@ class VolunteerCredit
 
   validate :approver_is_not_self
 
+  before_validation :set_earned_while_em_active, on: :create
+
   index({ member_id: 1 })
   index({ status: 1 })
   index({ created_at: 1 })
+  index({ tool_checkout_id: 1 }, unique: true,
+    partial_filter_expression: { tool_checkout_id: { "$type" => "objectId" } })
+  index({ status: 1, created_at: 1 })
 
   # ── Scopes ────────────────────────────────────────────────────────────────
 
@@ -77,6 +94,19 @@ class VolunteerCredit
 
   def self.year_count_for(member_id)
     where(status: { '$in' => ['approved', 'reversal'] })
+      .this_year
+      .where(member_id: member_id)
+      .sum(:credit_value).to_f
+  end
+
+  # Same as year_count_for, but excludes credits earned while an active
+  # earned membership applied -- those never count toward a Braintree
+  # discount, even after the member later converts to a paid subscription.
+  # Used only by check_discount_threshold!; every other display/summary use
+  # of "this year's credits" should keep including them. See #257.
+  def self.discount_eligible_year_count_for(member_id)
+    where(status: { '$in' => ['approved', 'reversal'] })
+      .where(earned_while_em_active: false)
       .this_year
       .where(member_id: member_id)
       .sum(:credit_value).to_f
@@ -147,17 +177,20 @@ class VolunteerCredit
     raise Error::Forbidden.new unless status == 'approved'
     raise Error::Forbidden.new if reversed
 
-    # Create the negative offsetting record
+    # Create the negative offsetting record. earned_while_em_active is copied
+    # explicitly (not recomputed) so this correctly cancels out the original
+    # in discount math regardless of the member's EM status at reversal time.
     reversal = VolunteerCredit.new(
-      member_id:       member_id,
-      issued_by_id:    reversed_by.id,
-      description:     "Reversal: #{description}",
-      credit_value:    -credit_value,
-      status:          'reversal',
-      reversal_of_id:  id,
-      reversal_reason: reason,
-      reversed_by_id:  reversed_by.id,
-      reversed_at:     Time.now
+      member_id:              member_id,
+      issued_by_id:           reversed_by.id,
+      description:            "Reversal: #{description}",
+      credit_value:           -credit_value,
+      status:                 'reversal',
+      reversal_of_id:         id,
+      reversal_reason:        reason,
+      reversed_by_id:         reversed_by.id,
+      reversed_at:            Time.now,
+      earned_while_em_active: earned_while_em_active
     )
     reversal.save!
 
@@ -176,22 +209,45 @@ class VolunteerCredit
 
   private
 
+  # Only meaningful for task completions, where a member claims a task and
+  # an admin/RM verifies it -- self-verifying your own work is the actual
+  # concern. Event attendance credits (task_id nil) are legitimately
+  # self-issued whenever the organizer closing the event also attended it,
+  # which VolunteerEvent#close! does for every attendee including the closer.
   def approver_is_not_self
+    return unless task_id.present?
     if issued_by_id && issued_by_id == member_id && status == 'approved'
       errors.add(:issued_by_id, 'cannot approve their own credit')
     end
   end
 
+  # Reversals inherit their flag explicitly from the original credit (see
+  # reverse!) rather than being recomputed here.
+  def set_earned_while_em_active
+    return if status == 'reversal'
+    self.earned_while_em_active = EarnedMembership.active.where(member_id: member_id).exists?
+  end
+
   # DM the member when their credit is approved.
   # Also sends a subscription nudge if discounts are configured but no subscription.
-  def notify_member_credit_awarded
+  def notify_member_credit_awarded(raise_errors: false)
     m          = member
     year_total = VolunteerCredit.year_count_for(m.id)
     slack_user = SlackUser.find_by(member_id: m.id)
     return unless slack_user
 
-    message = "🌟 You've been awarded a volunteer credit for: #{description}. " \
-              "You now have #{year_total} credit#{'s' if year_total != 1.0} this year."
+    common = ::Service::EmailTemplate.common_variables(m)
+    message = ::Service::EmailTemplate.render(
+      :volunteer_credit_awarded,
+      common.merge(
+        credit_description: description,
+        credit_value: credit_value,
+        year_total: year_total,
+        credit_plural: year_total == 1.0 ? 'credit' : 'credits'
+      ),
+      fallback: true,
+      format: :text
+    )
 
     if VolunteerCredit.discount_id.present? && !m.subscription_id.present?
       threshold      = VolunteerCredit.credits_per_discount
@@ -203,18 +259,27 @@ class VolunteerCredit
         credits_needed = [next_threshold - year_total, 0].max
 
         if credits_needed == 0
-          message += "\n\n💡 You've earned a volunteer discount! " \
-                     "Activate a subscription to have it automatically applied to your billing."
+          message += "\n\n" + ::Service::EmailTemplate.render(
+            :volunteer_credit_discount_earned, common, fallback: true, format: :text
+          )
         elsif credits_needed <= 1.0
-          message += "\n\n💡 You're #{credits_needed} credit#{'s' if credits_needed != 1.0} away from " \
-                     "earning a volunteer discount! Activate a subscription to have it applied automatically."
+          message += "\n\n" + ::Service::EmailTemplate.render(
+            :volunteer_credit_discount_progress,
+            common.merge(
+              credits_needed: credits_needed,
+              credit_plural: credits_needed == 1.0 ? 'credit' : 'credits'
+            ),
+            fallback: true,
+            format: :text
+          )
         end
       end
     end
 
     ::Service::SlackConnector.send_slack_message(message, slack_user.slack_id)
   rescue => e
-    Honeybadger.notify(e) if defined?(Honeybadger)
+    raise if raise_errors
+    Service::ErrorReporter.notify(e)
   end
 
   # DM the member when one of their credits is reversed
@@ -223,42 +288,55 @@ class VolunteerCredit
     slack_user = SlackUser.find_by(member_id: m.id)
     return unless slack_user
 
-    ::Service::SlackConnector.send_slack_message(
-      "⚠️ A volunteer credit has been reversed: *#{description}* " \
-      "(#{credit_value.abs} credit#{'s' if credit_value.abs != 1.0}). " \
-      "Reason: #{reason}. Contact us if you have questions.",
-      slack_user.slack_id
+    message = ::Service::EmailTemplate.render(
+      :volunteer_credit_reversed,
+      ::Service::EmailTemplate.common_variables(m).merge(
+        credit_description: description,
+        credit_value: credit_value.abs,
+        credit_plural: credit_value.abs == 1.0 ? 'credit' : 'credits',
+        reason: reason,
+        reversed_by_name: reversed_by.fullname
+      ),
+      fallback: true,
+      format: :text
     )
+    ::Service::SlackConnector.send_slack_message(message, slack_user.slack_id)
   rescue => e
-    Honeybadger.notify(e) if defined?(Honeybadger)
+    Service::ErrorReporter.notify(e)
   end
 
   # Notify the treasurer channel when a reversed credit had triggered a discount,
   # so they can manually review and adjust Braintree billing cycles if appropriate.
   def notify_braintree_review_needed(reversed_by, reason)
     m          = member
-    member_url = ::BraintreeService::Notification.get_member_profile(m)
-
-    ::Service::SlackConnector.send_slack_message(
-      "💳 Manual Braintree review needed: A volunteer credit for #{member_url} " \
-      "that contributed to a discount award has been reversed by *#{reversed_by.fullname}*. " \
-      "Reason: #{reason}. Please review and adjust discount billing cycles in Braintree if appropriate.",
-      ::Service::SlackConnector.treasurer_channel
+    message = ::Service::EmailTemplate.render(
+      :volunteer_braintree_review,
+      ::Service::EmailTemplate.common_variables(m).merge(
+        reversed_by_name: reversed_by.fullname,
+        reason: reason
+      ),
+      fallback: true,
+      format: :text
     )
+    ::Service::SlackConnector.send_slack_message(message, ::Service::SlackConnector.treasurer_channel)
   rescue => e
-    Honeybadger.notify(e) if defined?(Honeybadger)
+    Service::ErrorReporter.notify(e)
   end
 
   # Check if this credit crosses the discount threshold and apply Braintree discount.
   # Skips reversal records entirely — they are accounting offsets, not new credits.
-  def check_discount_threshold!
+  def check_discount_threshold!(raise_errors: false)
     return if status == 'reversal'
     return if VolunteerCredit.discount_id.blank?
+    # This specific credit was earned while an active earned membership
+    # applied -- never itself counts toward or triggers a discount, even
+    # after the member later converts to a paid subscription. See #257.
+    return if earned_while_em_active
 
     m = member
-    return if EarnedMembership.where(member_id: m.id).exists?
+    return if EarnedMembership.active.where(member_id: m.id).exists?
 
-    year_total     = VolunteerCredit.year_count_for(m.id)
+    year_total     = VolunteerCredit.discount_eligible_year_count_for(m.id)
     discounts_used = VolunteerCredit.discounts_applied_this_year_for(m.id)
     threshold      = VolunteerCredit.credits_per_discount
     max_discounts  = VolunteerCredit.max_discounts_per_year
@@ -267,17 +345,20 @@ class VolunteerCredit
     return unless year_total >= threshold * (discounts_used + 1)
 
     unless m.subscription_id.present?
-      notify_no_subscription(m)
+      notify_no_subscription(m, raise_errors: raise_errors)
       return
     end
 
-    # Atomically claim the first unmarked credit — race condition guard
+    # Atomically claim the first unmarked, discount-eligible credit — race
+    # condition guard. earned_while_em_active: false excludes old EM-period
+    # credits from ever being claimed toward a discount here.
     claimed_doc = VolunteerCredit.collection.find_one_and_update(
       {
-        member_id:        member_id,
-        status:           'approved',
-        discount_applied: false,
-        created_at:       { :$gte => Time.now.beginning_of_year }
+        member_id:              member_id,
+        status:                 'approved',
+        discount_applied:       false,
+        earned_while_em_active: false,
+        created_at:             { :$gte => Time.now.beginning_of_year }
       },
       { :$set => { discount_applied: true, discount_applied_at: Time.now } },
       sort:            { created_at: 1 },
@@ -290,7 +371,7 @@ class VolunteerCredit
 
     if remaining > 0
       VolunteerCredit.approved.this_year
-                     .where(member_id: member_id, discount_applied: false)
+                     .where(member_id: member_id, discount_applied: false, earned_while_em_active: false)
                      .order_by(created_at: :asc)
                      .each do |credit|
         break if remaining <= 0
@@ -299,72 +380,87 @@ class VolunteerCredit
       end
     end
 
-    apply_braintree_discount(m)
+    apply_braintree_discount(m, raise_errors: raise_errors)
   end
 
-  def apply_braintree_discount(m)
+  def apply_braintree_discount(m, raise_errors: false)
     discount_id = VolunteerCredit.discount_id
     result      = BraintreeService::VolunteerDiscount.apply(m, discount_id, 1)
 
     if result == :no_subscription
-      notify_no_subscription(m)
+      notify_no_subscription(m, raise_errors: raise_errors)
     else
-      notify_discount_applied(m, result)
+      notify_discount_applied(m, result, raise_errors: raise_errors)
     end
   rescue => e
-    Honeybadger.notify(e) if defined?(Honeybadger)
+    raise if raise_errors
+    Service::ErrorReporter.notify(e)
     notify_discount_error(m, e)
   end
 
-  def notify_discount_applied(m, discount_info)
+  def notify_discount_applied(m, discount_info, raise_errors: false)
     amount      = discount_info[:amount]
     cycles      = discount_info[:cycles_added]
     total       = discount_info[:total_cycles]
     description = discount_info[:description]
-    member_url  = ::BraintreeService::Notification.get_member_profile(m)
     id_str      = m.id.to_s
     cycles_str  = cycles == 1 ? '1 billing cycle' : "#{cycles} billing cycles"
     amount_str  = "$#{format('%.2f', amount)}/mo"
 
     slack_user = SlackUser.find_by(member_id: m.id)
     if slack_user
-      ::Service::SlackConnector.send_slack_message(
-        "🎉 You've earned a volunteer discount! *#{amount_str}* will be applied " \
-        "to your next #{cycles_str}.",
-        slack_user.slack_id
+      member_message = ::Service::EmailTemplate.render(
+        :volunteer_discount_applied_member,
+        ::Service::EmailTemplate.common_variables(m).merge(amount: amount_str, billing_cycles: cycles_str),
+        fallback: true,
+        format: :text
       )
+      ::Service::SlackConnector.send_slack_message(member_message, slack_user.slack_id)
     end
 
-    ::Service::SlackConnector.send_slack_message(
-      "💰 Volunteer discount applied for #{member_url} (ID: #{id_str}) — " \
-      "*#{amount_str}* for #{cycles_str} (#{total} total queued). Discount: #{description}",
-      ::Service::SlackConnector.treasurer_channel
+    admin_message = ::Service::EmailTemplate.render(
+      :volunteer_discount_applied_admin,
+      ::Service::EmailTemplate.common_variables(m).merge(
+        member_id: id_str,
+        amount: amount_str,
+        billing_cycles: cycles_str,
+        total_cycles: total,
+        discount_description: description
+      ),
+      fallback: true,
+      format: :text
     )
+    ::Service::SlackConnector.send_slack_message(admin_message, ::Service::SlackConnector.treasurer_channel)
   rescue => e
-    Honeybadger.notify(e) if defined?(Honeybadger)
+    raise if raise_errors
+    Service::ErrorReporter.notify(e)
     notify_discount_error(m, e) rescue nil
   end
 
-  def notify_no_subscription(m)
-    member_url = ::BraintreeService::Notification.get_member_profile(m)
-
-    ::Service::SlackConnector.send_slack_message(
-      "⚠️ Volunteer discount earned by #{member_url} (ID: #{m.id}) but no active " \
-      "subscription found. Credits preserved — will apply automatically once a subscription is activated.",
-      ::Service::SlackConnector.logs_channel
+  def notify_no_subscription(m, raise_errors: false)
+    message = ::Service::EmailTemplate.render(
+      :volunteer_discount_no_subscription,
+      ::Service::EmailTemplate.common_variables(m),
+      fallback: true,
+      format: :text
     )
+    ::Service::SlackConnector.send_slack_message(message, ::Service::SlackConnector.logs_channel)
   rescue => e
-    Honeybadger.notify(e) if defined?(Honeybadger)
+    raise if raise_errors
+    Service::ErrorReporter.notify(e)
   end
 
   def notify_discount_error(m, error)
-    member_url = (::BraintreeService::Notification.get_member_profile(m) rescue m.fullname)
-
-    ::Service::SlackConnector.send_slack_message(
-      "🚨 Error applying volunteer discount for #{member_url} (ID: #{m.id}): #{error.message}",
-      ::Service::SlackConnector.logs_channel
+    message = ::Service::EmailTemplate.render(
+      :volunteer_discount_error,
+      ::Service::EmailTemplate.common_variables(m).merge(
+        error_message: error.message
+      ),
+      fallback: true,
+      format: :text
     )
+    ::Service::SlackConnector.send_slack_message(message, ::Service::SlackConnector.logs_channel)
   rescue => e
-    Honeybadger.notify(e) if defined?(Honeybadger)
+    Service::ErrorReporter.notify(e)
   end
 end

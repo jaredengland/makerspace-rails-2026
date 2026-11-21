@@ -1,4 +1,6 @@
 require 'rails_helper'
+require_relative 'support/fix_ticket_api_schemas'
+require_relative 'support/home_api_schemas'
 
 RSpec.configure do |config|
   # Specify a root folder where Swagger JSON files are generated
@@ -14,6 +16,34 @@ RSpec.configure do |config|
   # the root example_group in your specs, e.g. describe '...', swagger_doc: 'v2/swagger.json'
 
   definitions = {
+    ContinuousPaidMembership: {
+      type: :object, additionalProperties: false,
+      properties: { continuousPaidMembershipMonths: { type: :integer, minimum: 0 },
+        revision: { type: :integer, minimum: 0 }, estimated: { type: :boolean } },
+      required: %w[continuousPaidMembershipMonths revision estimated]
+    },
+    IncreaseContinuousPaidMembership: {
+      type: :object,
+      properties: { continuousPaidMembershipMonths: { type: :integer, minimum: 0 },
+        expectedRevision: { type: :integer, minimum: 0 }, reason: { type: :string, minLength: 1, maxLength: 2000 } },
+      required: %w[continuousPaidMembershipMonths expectedRevision reason]
+    },
+    EventbriteRecord: {
+      type: :object, properties: {
+        id: { type: :string }, organizationId: { type: :string }, eventbriteId: { type: :string },
+        name: { type: :string, nullable: true }, email: { type: :string, nullable: true }, status: { type: :string, nullable: true },
+        eventId: { type: :string, nullable: true }, orderId: { type: :string, nullable: true }, ticketClassId: { type: :string, nullable: true },
+        memberId: { type: :string, nullable: true }, memberIds: { type: :array, items: { type: :string } },
+        ticketClassName: { type: :string, nullable: true }, refunded: { type: :boolean },
+        event: { type: :object, nullable: true, properties: { name: { type: :string, nullable: true }, startsAt: { type: :string, nullable: true }, timezone: { type: :string, nullable: true } } },
+        costs: { type: :object }, cost: { type: :object }, free: { type: :boolean }, quantityTotal: { type: :integer, nullable: true },
+        linkConflict: { type: :boolean }, startsAt: { type: :string, nullable: true }, timezone: { type: :string, nullable: true },
+        invalidatedAt: { type: :string, nullable: true }, invalidationReason: { type: :string, nullable: true },
+        refundedAt: { type: :string, nullable: true, description: 'Provider refund timestamp, falling back to the provider changed timestamp. Null when the provider date is unknown, even for refunded/invalidated orders; never the import time.' },
+        attendees: { type: :array, items: { '$ref' => '#/components/schemas/EventbriteRecord' } },
+        ticketClasses: { type: :array, items: { '$ref' => '#/components/schemas/EventbriteRecord' } }
+      }, required: %w[id organizationId eventbriteId]
+    },
     Card: {
       type: :object,
       properties: {
@@ -22,7 +52,7 @@ RSpec.configure do |config|
         expiry: { type: :number },
         validity: {
           type: :string,
-          enum: ["activeMember", "expired", "inactive", "lost", "nonMember", "revoked", "stolen"]
+          enum: ["activeMember", "pending", "expired", "inactive", "lost", "nonMember", "revoked", "stolen"]
         },
         uid: { type: :string },
       },
@@ -187,7 +217,7 @@ RSpec.configure do |config|
         id: { type: :string },
         name: { type: :string },
         description: { type: :string },
-        settled: { type: :boolean },
+        settled: { type: :boolean, description: 'Payment received, including confirmed cash/check receipts held until first-fob issuance; paid months accrue when membership time is applied.' },
         pastDue: { type: :boolean },
         createdAt: { type: :string },
         dueDate: { type: :string },
@@ -243,6 +273,8 @@ RSpec.configure do |config|
         disabled: { type: :boolean, 'x-nullable': true },
         promotionEndDate: { type: :string, 'x-nullable': true },
         isPromotion: { type: :boolean, 'x-nullable': true },
+        householdSize: { type: :integer, 'x-nullable': true,
+                         description: 'Adults a household plan covers (2 or more). A household plan with none set counts as 2; null for a plan that is not a household plan.' },
       },
       required: [
         :name,
@@ -250,6 +282,84 @@ RSpec.configure do |config|
         :resourceClass,
         :quantity
       ]
+    },
+
+    Group: {
+      type: :object,
+      description: 'A household: the primary member and the secondary adults linked to them.',
+      properties: {
+        id: { type: :string },
+        groupName: { type: :string, description: "The primary member's id." },
+        groupRep: { type: :string },
+        expiry: { type: :integer, 'x-nullable': true, description: 'Milliseconds. The primary expiry; secondaries and their cards always equal it.' },
+        size: { type: :integer, description: 'Adults the primary household plan covers.' },
+        seatsUsed: { type: :integer, description: 'The primary, the linked secondaries and the open invitations.' },
+        paymentAccepted: { type: :boolean, description: 'The most recent household-plan payment was taken (applied, or held until the first fob), is not refunded or disputed, and the paid time has not run out.' },
+        primaryMember: { type: :object, 'x-nullable': true },
+        secondaryMembers: { type: :array, items: { type: :object } },
+        invitations: { type: :array, items: { type: :object } },
+      },
+      required: [:id, :groupName, :size, :seatsUsed, :paymentAccepted]
+    },
+
+    HouseholdSummary: {
+      type: :object,
+      properties: {
+        id: { type: :string },
+        display_name: { type: :string },
+        size: { type: :integer },
+        seats_used: { type: :integer },
+        payment_accepted: { type: :boolean },
+        expiration_time: { type: :integer, 'x-nullable': true },
+        primary: { type: :object },
+        members: { type: :array, items: { type: :object } },
+        invitations: { type: :array, description: 'Only for the primary.', items: { type: :object } },
+      },
+      required: [:id, :size, :seats_used, :payment_accepted]
+    },
+
+    Household: {
+      type: :object,
+      description: "The signed-in member's household state. Keys are snake_case.",
+      properties: {
+        role: { type: :string, enum: %w[primary secondary], 'x-nullable': true },
+        household_plan: { type: :boolean },
+        can_invite: { type: :boolean },
+        invite_blocked_reason: { type: :string, 'x-nullable': true, description: 'Plain words for why the invite is not available.' },
+        plan_size: { type: :integer, 'x-nullable': true },
+        household: { '$ref' => '#/components/schemas/HouseholdSummary', 'x-nullable': true },
+        invited_to_a_household: { type: :boolean, description: 'An open invitation is waiting for this member\'s email.' },
+        invitation_id: { type: :string, description: 'Only in the response to creating an invitation.' },
+      },
+      required: [:household_plan, :can_invite, :invited_to_a_household]
+    },
+
+    HouseholdInvitationPublic: {
+      type: :object,
+      description: 'What the link page may show before signing in.',
+      properties: {
+        status: { type: :string, enum: %w[pending expired accepted revoked] },
+        inviter_name: { type: :string, 'x-nullable': true, description: 'First name and last initial. Null once the invitation was cancelled, expired or used.' },
+        invited_email: { type: :string, 'x-nullable': true, description: 'Null once the invitation was cancelled, expired or used.' },
+        expires_at: { type: :string },
+      },
+      required: [:status, :expires_at]
+    },
+
+    HouseholdInvitationPreview: {
+      type: :object,
+      description: 'What the signed-in invited person sees before joining, including the address that must match.',
+      properties: {
+        status: { type: :string },
+        primary_name: { type: :string, 'x-nullable': true },
+        household_address: { type: :string, 'x-nullable': true },
+        your_address: { type: :string },
+        address_matches: { type: :boolean },
+        payment_accepted: { type: :boolean },
+        blocked_reason: { type: :string, 'x-nullable': true },
+        expires_at: { type: :string },
+      },
+      required: [:status, :address_matches, :payment_accepted]
     },
 
     InvoiceOption: {
@@ -267,6 +377,49 @@ RSpec.configure do |config|
       ]
     },
 
+    SlackProvisioning: {
+      type: :object,
+      properties: {
+        status: {
+          type: :string,
+          enum: %w[
+            unknown blocked not_invited invite_confirmed invite_pending guest
+            manual_invite_required manual_promotion_required full_member
+          ]
+        },
+        inviteConfirmedAt: { type: :string, format: :'date-time', 'x-nullable': true },
+        inviteSource: { type: :string, enum: %w[api slack_user_record], 'x-nullable': true },
+        inviteMode: { type: :string, enum: %w[full_member single_channel_guest], 'x-nullable': true },
+        joinedAt: { type: :string, format: :'date-time', 'x-nullable': true },
+        fullMemberAt: { type: :string, format: :'date-time', 'x-nullable': true },
+        manualActionRequired: { type: :string, enum: %w[invite promotion], 'x-nullable': true },
+        lastError: { type: :string, 'x-nullable': true, description: 'Why the latest Slack invite attempt failed, or that the email changed and a re-invite is needed' },
+        lastAttemptAt: { type: :string, format: :'date-time', 'x-nullable': true }
+      },
+      required: [:status]
+    },
+    GoogleDriveProvisioning: {
+      type: :object,
+      properties: {
+        status: {
+          type: :string,
+          enum: %w[unknown blocked pending_activation not_provisioned partial failed complete]
+        },
+        resourcesAccessConfirmedAt: { type: :string, format: :'date-time', 'x-nullable': true },
+        transferAccessConfirmedAt: { type: :string, format: :'date-time', 'x-nullable': true }
+      },
+      required: [:status]
+    },
+    MemberProvisioning: {
+      type: :object,
+      properties: {
+        activationEligible: { type: :boolean },
+        email: { type: :string },
+        slack: { '$ref' => '#/components/schemas/SlackProvisioning' },
+        googleDrive: { '$ref' => '#/components/schemas/GoogleDriveProvisioning' }
+      },
+      required: [:activationEligible, :email, :slack, :googleDrive]
+    },
     BaseMember: {
       type: :object,
       properties: {
@@ -278,8 +431,31 @@ RSpec.configure do |config|
         expirationTime: { type: :number, 'x-nullable': true },
         memberContractSignedDate: { type: :string, 'x-nullable': true },
         memberContractOnFile: { type: :boolean },
+        paidPendingStart: { type: :boolean },
+        fobIssued: { type: :boolean, description: 'False when no fob (card) has ever been issued to the member' },
+        household: {
+          type: :object, nullable: true,
+          properties: {
+            groupName: { type: :string, nullable: true },
+            displayName: { type: :string, nullable: true },
+            role: { type: :string, enum: %w[primary secondary], nullable: true },
+            primaryMemberName: { type: :string, nullable: true },
+            memberCount: { type: :integer }
+          }
+        },
         silenceEmails: { type: :boolean, 'x-nullable': true },
         notes: { type: :string, 'x-nullable': true },
+        resourceManagerShopIds: { type: :array, items: { type: :string } },
+        checkoutApproverShopIds: { type: :array, items: { type: :string } },
+        checkoutApproverToolIds: { type: :array, items: { type: :string } },
+        slackManualDeactivationRequired: {
+          type: :boolean,
+          description: 'True for revoked members when Slack must be deactivated manually because SLACK_ADMIN_TOKEN is not configured.'
+        },
+        provisioning: {
+          allOf: [{ '$ref' => '#/components/schemas/MemberProvisioning' }],
+          'x-nullable': true
+        },
       },
       required: [
         :firstname,
@@ -294,6 +470,12 @@ RSpec.configure do |config|
           type: :object,
           properties: {
             phone: { type: :string, 'x-nullable': true },
+            signupSource: { type: :string, 'x-nullable': true, description: 'Optional source: class, walk_in, friend, website, social, other, eventbrite or declined' },
+            signupSourceDetail: { type: :string, 'x-nullable': true, maxLength: 100, description: 'Free text for class, friend or other' },
+            signupEventbriteEventId: { type: :string, 'x-nullable': true, description: 'Local Eventbrite event document ID selected at signup' },
+            signupEventbriteEventSnapshot: { type: :object, 'x-nullable': true, properties: { name: { type: :string }, startsAt: { type: :string }, timezone: { type: :string } } },
+            signupSourcePromptPending: { type: :boolean, description: 'New provider account should be offered the optional source question' },
+            referredByMemberId: { type: :string, 'x-nullable': true, description: 'Staff-linked member who referred this one; kept only when signupSource is friend. Returned to admin and board only.' },
             address: {
               type: :object,
               'x-nullable': true,
@@ -320,7 +502,25 @@ RSpec.configure do |config|
             subscriptionId: { type: :string, 'x-nullable': true },
             subscription: { type: :boolean },
             customerId: { type: :string, 'x-nullable': true },
+            expiringPaymentCardTypes: { type: :string, 'x-nullable': true },
             earnedMembershipId: { type: :string, 'x-nullable': true },
+            earnedMembershipActive: { type: :boolean },
+            householdRole: { type: :string, enum: %w[primary secondary], nullable: true },
+            householdSetupNeeded: { type: :boolean, description: 'Admin and board only: billed on a household plan with no household yet' },
+            isFobIssuer: { type: :boolean, description: "Holds the fob-issuer checkout and may issue first key fobs" },
+            referredByMemberName: { type: :string, 'x-nullable': true, description: 'Admin and board only: name of the member linked as the referrer' },
+            activeRentals: {
+              type: :array,
+              description: 'Admin and board only: rentals still marked active, so staff can act when the membership ends',
+              items: {
+                type: :object,
+                properties: {
+                  id: { type: :string }, number: { type: :string },
+                  description: { type: :string, description: 'Space number and description' },
+                  billing: { type: :boolean, description: 'The rental still has its own subscription' }
+                }
+              }
+            },
           },
           required: [:id, :expirationTime]
         }
@@ -341,7 +541,12 @@ RSpec.configure do |config|
         memberContractOnFile: { type: :boolean },
         notes: { type: :string },
         silenceEmails: { type: :boolean },
+        resourceManagerShopIds: { type: :array, items: { type: :string } },
         phone: { type: :string },
+        signupSource: { type: :string, description: 'Optional source: class, walk_in, friend, website, social, other, eventbrite or declined' },
+        signupSourceDetail: { type: :string, maxLength: 100, description: 'Free text for class, friend or other' },
+        signupEventbriteEventId: { type: :string, description: 'Local eligible Eventbrite event document ID' },
+        referredByMemberId: { type: :string, description: 'Member who referred this one; kept only when signupSource is friend' },
         address: {
           type: :object,
           properties: {
@@ -367,6 +572,413 @@ RSpec.configure do |config|
           ]
         }
       ]
+    },
+    ReservationResourceConfig: {
+      type: :object,
+      properties: {
+        reservable: { type: :boolean, default: false },
+        maxConcurrentReservations: { type: :integer, minimum: 1, default: 1 },
+        reservationHorizonDays: { type: :integer, minimum: 0, default: 7 },
+        maxReservationDurationHours: { type: :number, minimum: 0.5, multipleOf: 0.5, default: 8 },
+        minimumAdvanceNoticeHours: { type: :number, minimum: 0, default: 2 },
+        prohibitSameDayReservations: { type: :boolean, default: false },
+        reservationFullDay: { type: :boolean, default: false },
+        durationFees: {
+          type: :array,
+          default: [],
+          items: {
+            type: :object,
+            properties: {
+              invoiceOptionId: { type: :string },
+              minimumHours: { type: :number, nullable: true, description: "Required for hourly rules; positive half-hour increments." },
+              maximumHours: { type: :number, nullable: true, description: "Required for hourly rules; at least minimumHours." },
+              fullDay: { type: :boolean, default: false }
+            },
+            required: [:invoiceOptionId]
+          }
+        },
+        reservationRequiresApproval: { type: :boolean, default: false },
+        reservationPrerequisiteToolIds: { type: :array, items: { type: :string } }
+      }
+    },
+    Shop: {
+      allOf: [
+        { '$ref' => '#/components/schemas/ReservationResourceConfig' },
+        {
+          type: :object,
+          properties: {
+            canGenerateCheckoutRequiredSheet: { type: :boolean, readOnly: true },
+            outOfService: { type: :boolean },
+            outOfServiceNote: { type: :string, nullable: true },
+            resourceManagers: { type: :array, items: { '$ref' => '#/components/schemas/FixPerson' } },
+            id: { type: :string },
+            name: { type: :string },
+            requestorAnnotation: { type: :string, nullable: true },
+            wikiUrl: { type: :string, format: :uri },
+            wikiUrlOverride: { type: :string, format: :uri, 'x-nullable': true },
+            gdriveId: { type: :string, 'x-nullable': true },
+            slackChannel: { type: :string, 'x-nullable': true },
+            slackAnnounceEmptyReservations: { type: :boolean, default: false, description: 'Include an invitation to book when the shop or tool agenda is empty. Editable by owning-shop Resource Managers, Admins and Board members.' },
+            disabled: { type: :boolean },
+            colorId: { type: :string, pattern: '^\d+$', 'x-nullable': true },
+            reservationPrerequisiteNames: { type: :array, items: { type: :string } },
+            googleResourceId: { type: :string, 'x-nullable': true },
+            resourceEmail: { type: :string, 'x-nullable': true },
+            floorName: { type: :string },
+            capacity: { type: :integer },
+            toolCount: { type: :integer, minimum: 0 }
+          },
+          required: [:id, :name, :requestorAnnotation, :wikiUrl, :reservable, :toolCount]
+        }
+      ]
+    },
+    ToolSettingsWrite: {
+      type: :object,
+      description: 'Editable tool settings for owning-shop managers, admins and board members. Omitted fields retain their values on update. Operational notes are saved with the other settings; additional approvers use the dedicated notes or annotation endpoints.',
+      properties: {
+        checkout_training_plan_url: { type: :string, nullable: true, maxLength: 2048 },
+        checkout_expiration_years: { type: :integer, nullable: true, enum: [nil, 1, 2, 3, 4, 5] },
+        name: { type: :string, description: 'Unique within the shop, ignoring case.' },
+        shop_id: { type: :string },
+        location_id: { type: :string, nullable: true, description: 'Location in the selected shop. Empty or null clears it.' },
+        requestor_annotation: { type: :string, nullable: true, description: 'Null or whitespace clears the annotation; tools fall back to their shop.' },
+        wiki_url: { type: :string, nullable: true },
+        gdrive_id: { type: :string, nullable: true },
+        description: { type: :string, nullable: true },
+        notes: { type: :string, nullable: true, description: 'Private operational notes. Empty or null clears them.' },
+        open: { type: :boolean }, disabled: { type: :boolean },
+        allow_pending: { type: :boolean, description: 'Allow pending members to request checkout and reservations. Send false to clear; defaults to false on creation.' },
+        grants_fob_issuance: { type: :boolean, description: 'Admin/board only (ignored for resource managers). Members with an active checkout on this tool may issue first key fobs. Only one tool may set it.' },
+        announce: { type: :boolean }, announce_channel: { type: :string, nullable: true },
+        users_channel: { type: :string, nullable: true },
+        prerequisite_ids: { type: :array, items: { type: :string } },
+        reservable: { type: :boolean }, max_concurrent_reservations: { type: :integer },
+        reservation_horizon_days: { type: :integer }, minimum_advance_notice_hours: { type: :number },
+        prohibit_same_day_reservations: { type: :boolean }, reservation_full_day: { type: :boolean },
+        max_reservation_duration_hours: { type: :number }, reservation_requires_approval: { type: :boolean },
+        reservation_prerequisite_tool_ids: { type: :array, items: { type: :string } },
+        duration_fees: { type: :array, items: { type: :object, properties: {
+          invoice_option_id: { type: :string }, minimum_hours: { type: :number },
+          maximum_hours: { type: :number }, full_day: { type: :boolean }
+        } } }
+      }
+    },
+    Tool: {
+      allOf: [
+        { '$ref' => '#/components/schemas/ReservationResourceConfig' },
+        {
+          type: :object,
+          properties: {
+            checkoutTrainingPlanUrl: { type: :string, nullable: true },
+            checkoutExpirationYears: { type: :integer, nullable: true },
+            canManageCheckoutExpiration: { type: :boolean },
+            canGenerateCheckoutRequiredSheet: { type: :boolean, readOnly: true, description: 'Present in authenticated management tool catalogs; false for unavailable resources or viewers without authority.' },
+            id: { type: :string },
+            shopId: { type: :string },
+            name: { type: :string },
+            requestorAnnotation: { type: :string, nullable: true },
+            wikiUrl: { type: :string, format: :uri },
+            wikiUrlOverride: { type: :string, format: :uri, 'x-nullable': true },
+            gdriveId: { type: :string, 'x-nullable': true },
+            description: { type: :string, 'x-nullable': true },
+            open: { type: :boolean },
+            disabled: { type: :boolean },
+            outOfService: { type: :boolean, default: false },
+            allowPending: { type: :boolean, default: false },
+            grantsFobIssuance: { type: :boolean, default: false },
+            announce: { type: :boolean },
+            announceChannel: { type: :string, 'x-nullable': true },
+            usersChannel: { type: :string, 'x-nullable': true },
+            prerequisiteIds: { type: :array, items: { type: :string } },
+            prerequisiteNames: { type: :array, items: { type: :string } },
+            locationId: { type: :string, 'x-nullable': true },
+            locationName: { type: :string, 'x-nullable': true },
+            effectiveReservationPrerequisiteIds: { type: :array, items: { type: :string } },
+            reservationPrerequisiteNames: { type: :array, items: { type: :string } },
+            shopName: { type: :string },
+            notes: { type: :string, 'x-nullable': true, description: "Present only when the member may view operational notes." },
+            unmetPrerequisiteIds: { type: :array, items: { type: :string }, description: "Present when availability is evaluated for a signed-in member." },
+            unmetPrerequisiteNames: { type: :array, items: { type: :string }, description: "Present when availability is evaluated for a signed-in member." },
+            requestable: { type: :boolean, description: "Present when availability is evaluated for a signed-in member." }
+          },
+          required: [:id, :shopId, :name, :requestorAnnotation, :wikiUrl, :reservable]
+        }
+      ]
+    },
+    Location: {
+      type: :object,
+      properties: {
+        id: { type: :string },
+        name: { type: :string },
+        kind: { type: :string, 'x-nullable': true },
+        parentId: { type: :string, 'x-nullable': true },
+        shopId: { type: :string },
+        svgElementId: { type: :string, 'x-nullable': true },
+        xPct: { type: :number, 'x-nullable': true },
+        yPct: { type: :number, 'x-nullable': true },
+        shapePoints: {
+          type: :array,
+          'x-nullable': true,
+          items: {
+            type: :object,
+            properties: { x: { type: :number }, y: { type: :number } },
+            required: [:x, :y]
+          }
+        },
+        floorName: { type: :string, enum: %w[B 1 2], description: 'Floor plan the location is drawn on; the shop\'s own floor when not set on the location.' },
+        icon: { type: :string, enum: Location::ICONS, 'x-nullable': true, description: 'Marker glyph; null draws the default pin.' },
+        toolNames: { type: :array, items: { type: :string } },
+        toolIds: { type: :array, items: { type: :string } }
+      },
+      required: [:id, :name, :shopId, :toolNames, :toolIds]
+    },
+    LocationWrite: {
+      type: :object,
+      properties: {
+        name: { type: :string },
+        kind: { type: :string },
+        parent_id: { type: :string },
+        shop_id: { type: :string },
+        svg_element_id: { type: :string },
+        x_pct: { type: :number },
+        y_pct: { type: :number },
+        floor_name: { type: :string, enum: %w[B 1 2], description: 'Blank uses the shop\'s floor; a nested location inherits its parent\'s.' },
+        icon: { type: :string, enum: Location::ICONS },
+        shape_points: {
+          type: :array,
+          items: {
+            type: :object,
+            properties: { x: { type: :number }, y: { type: :number } },
+            required: [:x, :y]
+          }
+        }
+      },
+      required: [:name, :shop_id]
+    },
+    CheckoutApprover: {
+      type: :object,
+      properties: {
+        toolGroups: { type: :array, items: { type: :object, required: %w[id name shopId], properties: {
+          id: { type: :string }, name: { type: :string }, shopId: { type: :string }
+        } }, description: 'Explicit group assignments, separate from effective individual tool grants.' },
+        toolGroupIds: { type: :array, items: { type: :string } },
+        tools: { type: :array, items: { type: :object, required: %w[id name shopId outOfService], properties: { id: { type: :string }, name: { type: :string }, shopId: { type: :string }, outOfService: { type: :boolean } } } },
+        outOfServiceToolNames: { type: :array, items: { type: :string } },
+        id: { type: :string },
+        memberId: { type: :string },
+        shopIds: { type: :array, items: { type: :string } },
+        toolIds: { type: :array, items: { type: :string } },
+        shopNames: { type: :array, items: { type: :string } },
+        toolNames: { type: :array, items: { type: :string } }
+      },
+      required: [:id, :memberId, :shopIds, :toolIds, :toolGroups]
+    },
+    Reservation: {
+      type: :object,
+      properties: {
+        toolGroupIds: { type: :array, items: { type: :string } },
+        selectedToolIds: { type: :array, items: { type: :string } },
+        groupSnapshots: { type: :array, items: { type: :object }, description: 'Saved group names, revisions, physical members and prerequisites at selection time.' },
+        outOfServiceToolNames: { type: :array, items: { type: :string } },
+        id: { type: :string },
+        title: { type: :string },
+        memberId: { type: :string },
+        memberName: { type: :string },
+        shopId: { type: :string },
+        shopName: { type: :string },
+        reservationScope: { type: :string, enum: %w[shop tools] },
+        toolIds: { type: :array, items: { type: :string } },
+        toolNames: { type: :array, items: { type: :string } },
+        startAt: { type: :string, format: 'date-time' },
+        endAt: { type: :string, format: 'date-time' },
+        fullDay: { type: :boolean, default: false },
+        invoice: { type: :string, nullable: true, description: "Attached invoice ID; included only for the owner or a manager." },
+        notifiedAt: { type: :string, nullable: true, description: "Slack message timestamp (not a date-time); included only for the owner or a manager." },
+        feeSnapshot: {
+          type: :array,
+          description: "Saved fee line items; included only for the owner or a manager.",
+          items: {
+            type: :object,
+            properties: {
+              resourceId: { type: :string },
+              resourceName: { type: :string },
+              invoiceOptionId: { type: :string },
+              name: { type: :string },
+              unitHours: { type: :number, minimum: 0 },
+              units: { type: :integer, minimum: 1 },
+              unitAmount: { type: :number, minimum: 0 },
+              amount: { type: :number, minimum: 0 }
+            },
+            required: [:resourceId, :resourceName, :invoiceOptionId, :name, :unitHours, :units, :unitAmount, :amount]
+          }
+        },
+        status: { type: :string, enum: %w[pending unpaid approved denied cancelled] },
+        approvalReasons: { type: :array, items: { type: :string } },
+        approvalDetails: {
+          type: :array,
+          items: {
+            type: :object,
+            properties: {
+              code: { type: :string },
+              message: { type: :string },
+              blackoutId: { type: :string, 'x-nullable': true },
+              blackoutTitle: { type: :string, 'x-nullable': true }
+            },
+            required: [:code, :message]
+          }
+        },
+        source: { type: :string, enum: %w[portal slack] },
+        calendarEventId: { type: :string, 'x-nullable': true },
+        calendarHtmlLink: { type: :string, format: :uri, 'x-nullable': true },
+        calendarSyncStatus: { type: :string, 'x-nullable': true },
+        calendarSyncError: { type: :string, 'x-nullable': true }
+      },
+      required: [:id, :title, :memberId, :shopId, :reservationScope, :toolIds, :startAt, :endAt, :status, :fullDay]
+    },
+    ReservationPreview: {
+      type: :object,
+      properties: {
+        eligible: { type: :boolean },
+        errors: { type: :array, items: { type: :string } },
+        conflicts: { type: :array, items: { type: :string } },
+        missingPrerequisites: {
+          type: :array,
+          items: {
+            type: :object,
+            properties: { id: { type: :string }, name: { type: :string } }
+          }
+        },
+        requiresApproval: { type: :boolean },
+        approvalReasons: { type: :array, items: { type: :string } },
+        approvalDetails: {
+          type: :array,
+          items: {
+            type: :object,
+            properties: {
+              code: { type: :string },
+              message: { type: :string },
+              blackoutId: { type: :string, 'x-nullable': true },
+              blackoutTitle: { type: :string, 'x-nullable': true }
+            },
+            required: [:code, :message]
+          }
+        },
+        feeLines: {
+          type: :array,
+          description: "Itemized duration fees for the proposed reservation.",
+          items: {
+            type: :object,
+            properties: {
+              resourceId: { type: :string },
+              resourceName: { type: :string },
+              invoiceOptionId: { type: :string },
+              name: { type: :string },
+              unitHours: { type: :number, minimum: 0 },
+              units: { type: :integer, minimum: 1 },
+              unitAmount: { type: :number, minimum: 0 },
+              amount: { type: :number, minimum: 0 }
+            },
+            required: [:resourceId, :resourceName, :invoiceOptionId, :name, :unitHours, :units, :unitAmount, :amount]
+          }
+        },
+        feeTotal: { type: :number, minimum: 0, description: "Amount due for this quote after paid invoice credit." },
+        feeConfirmation: {
+          type: :string,
+          description: "Opaque quote token. Send unchanged as feeConfirmation when creating or materially editing a fee-incurring reservation. Obtain a fresh preview after changing the reservation."
+        },
+        feeWarning: { type: :string, nullable: true, description: "Optional billing warning, such as overdue fee debt." },
+        maximumDurationHours: { type: :number, multipleOf: 0.5, minimum: 0 }
+      },
+      required: [
+        :eligible, :errors, :conflicts, :missingPrerequisites, :requiresApproval,
+        :approvalReasons, :approvalDetails, :maximumDurationHours, :feeLines, :feeTotal, :feeConfirmation
+      ]
+    },
+    ReservationBlackout: {
+      type: :object,
+      properties: {
+        id: { type: :string },
+        title: { type: :string },
+        shopId: { type: :string },
+        shopName: { type: :string },
+        recurrence: { type: :string, enum: %w[daily weekly] },
+        weekday: { type: :integer, minimum: 0, maximum: 6, 'x-nullable': true },
+        startTime: { type: :string, pattern: '^\d{2}:(?:00|30)$' },
+        endTime: { type: :string, pattern: '^\d{2}:(?:00|30)$' },
+        startDate: { type: :string, format: :date, 'x-nullable': true },
+        endDate: { type: :string, format: :date, 'x-nullable': true }
+      },
+      required: [:id, :title, :shopId, :recurrence, :startTime, :endTime]
+    },
+    ReservationAgenda: {
+      type: :object,
+      properties: {
+        outOfService: { type: :boolean, description: 'True when the shop or selected tool is out of service.' },
+        shopOutOfService: { type: :boolean },
+        toolOutOfService: { type: :boolean, description: 'Selected tool flag; false without a tool filter.' },
+        shopName: { type: :string },
+        toolName: { type: :string, 'x-nullable': true },
+        generatedAt: { type: :string, format: 'date-time' },
+        windowStart: { type: :string, format: 'date-time' },
+        windowEnd: { type: :string, format: 'date-time' },
+        upNext: {
+          type: :object,
+          'x-nullable': true,
+          properties: {
+            memberName: { type: :string },
+            slackUsername: { type: :string, 'x-nullable': true },
+            startAt: { type: :string, format: 'date-time' }
+          },
+          required: [:memberName, :startAt]
+        },
+        reservations: {
+          type: :array,
+          items: {
+            type: :object,
+            properties: {
+              title: { type: :string },
+              memberName: { type: :string },
+              slackUsername: { type: :string, 'x-nullable': true },
+              startAt: { type: :string, format: 'date-time' },
+              endAt: { type: :string, format: 'date-time' },
+              status: { type: :string, enum: %w[pending unpaid approved] },
+              reservationScope: { type: :string, enum: %w[shop tools] },
+              toolNames: { type: :array, items: { type: :string } },
+              outOfServiceToolNames: { type: :array, items: { type: :string } },
+              inProgress: { type: :boolean }
+            },
+            required: [
+              :title, :memberName, :startAt, :endAt, :status,
+              :reservationScope, :toolNames, :outOfServiceToolNames, :inProgress
+            ]
+          }
+        }
+      },
+      required: [
+        :shopName, :generatedAt, :windowStart, :windowEnd, :reservations
+      ]
+    },
+    SubscriptionCancellationImpact: {
+      type: :object,
+      properties: {
+        reservationCount: { type: :integer, minimum: 0 },
+        membershipExpiresAt: { type: :string, format: 'date-time', 'x-nullable': true },
+        reservations: {
+          type: :array,
+          items: {
+            type: :object,
+            properties: {
+              id: { type: :string },
+              title: { type: :string },
+              calendarHtmlLink: { type: :string, format: :uri, 'x-nullable': true },
+              startAt: { type: :string, format: 'date-time' },
+              endAt: { type: :string, format: 'date-time' }
+            },
+            required: [:id, :title, :startAt, :endAt]
+          }
+        }
+      },
+      required: [:reservationCount, :reservations]
     },
     PayPalAccount: {
       type: :object,
@@ -568,10 +1180,28 @@ RSpec.configure do |config|
             id: { type: :string },
             memberName: { type: :string },
             subscriptionId: { type: :string, 'x-nullable': true },
+            status: { type: :string, enum: Rental::STATUSES,
+                      description: 'awaiting_verification: the member says they have vacated; the spot is held until staff verify it is empty.' },
           },
           required: [:id, :memberName]
         }
       ]
+    },
+
+    PayNowRefusal: {
+      type: :object,
+      description: 'A Pay now request that was declined by the bank or not allowed (hard decline, not past due, cooldown, daily limit)',
+      properties: {
+        status: { type: :number },
+        error: { type: :string, description: 'payment_declined, hard_decline, cooldown or daily_cap' },
+        message: { type: :string },
+        failureType: { type: :string, 'x-nullable': true, description: "Braintree's soft_declined or hard_declined, or the transaction status, for a declined payment" },
+        failureMessage: { type: :string, 'x-nullable': true },
+        canPayNow: { type: :boolean },
+        payNowBlockedReason: { type: :string, 'x-nullable': true },
+        nextPayNowAt: { type: :string, 'x-nullable': true }
+      },
+      required: [:status, :error, :message]
     },
 
     Subscription: {
@@ -599,7 +1229,16 @@ RSpec.configure do |config|
         memberName: { type: :string },
         resourceClass: { type: :string },
         resourceId: { type: :string },
-        paymentMethodToken: { type: :string }
+        paymentMethodToken: { type: :string },
+        canPayNow: { type: :boolean, description: 'Whether the member can press Pay now for this past-due subscription right now' },
+        payNowBlockedReason: {
+          type: :string,
+          'x-nullable': true,
+          enum: ['hard_decline', 'cooldown', 'daily_cap', 'unavailable'],
+          description: 'Why Pay now is unavailable: hard_decline (change the payment method first), cooldown, daily_cap, unavailable (no unpaid invoice); null when available or not past due'
+        },
+        lastFailureMessage: { type: :string, 'x-nullable': true, description: 'Plain wording for why the last charge failed, for example insufficient funds; null when unknown' },
+        nextPayNowAt: { type: :string, 'x-nullable': true, description: 'When Pay now can be tried again after a cooldown or the daily cap (ISO 8601); null otherwise' }
       },
       required: [
         :id,
@@ -689,6 +1328,9 @@ RSpec.configure do |config|
   }
 
 
+  definitions.merge!(FixTicketApiSchemas::SCHEMAS)
+  definitions.merge!(HomeApiSchemas::SCHEMAS)
+
   config.openapi_specs = {
     'v1/swagger.json' => {
       openapi: '3.0.3',
@@ -700,14 +1342,20 @@ RSpec.configure do |config|
         { url: '/api', description: 'API base path' }
       ],
       components: {
+        securitySchemes: {
+          sessionAuth: {
+            type: :apiKey, in: :cookie, name: '_member-interface_session',
+            description: 'Devise session cookie from portal sign-in. Mutations also require the existing X-XSRF-TOKEN CSRF header.'
+          }
+        },
         schemas: {
           MemberStatus: {
             type: :string,
-            enum: ["activeMember", "inactive", "nonMember", "revoked"]
+            enum: ["activeMember", "pending", "inactive", "nonMember", "revoked", "suspended"]
           },
           MemberRole: {
             type: :string,
-            enum: ["admin", "resource_manager", "member"],
+            enum: ["admin", "board_member", "resource_manager", "member"],
           },
           PayPalAccountSummary: {
             type: :object,

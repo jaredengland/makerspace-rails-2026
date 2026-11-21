@@ -4,9 +4,15 @@ task :backup => :environment do
   config_file = "/tmp/mongodump_config.yml"
   backup_error = nil
   begin
-    Dir.mkdir(dump_dir) unless File.exists?(dump_dir)
+    Dir.mkdir(dump_dir) unless File.exist?(dump_dir)
     file_name = "makerauthBackup_#{Time.now.strftime('%m-%d-%Y')}.archive"
-    File.write(config_file, "uri: \"#{ENV['MLAB_URI']}\"\n")
+    # Strip stray wrapping quotes from the env var itself (e.g. left over from
+    # how it was set) -- mongoid.yml tolerates these by accident, since it
+    # embeds the value unquoted and YAML's own quote parsing strips them; this
+    # file wraps the value in its own quotes, so they'd otherwise end up as
+    # literal characters mongodump's URI parser rejects.
+    mlab_uri = ENV['MLAB_URI'].to_s.strip.sub(/\A(['"])(.*)\1\z/, '\2')
+    File.write(config_file, "uri: \"#{mlab_uri}\"\n")
     sh("/usr/bin/mongodump --config=#{config_file} --archive=#{dump_dir}/#{file_name}")
     Service::GoogleDrive.upload_backup(file_name)
     slack_message = "Daily backup complete."

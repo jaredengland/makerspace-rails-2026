@@ -6,8 +6,10 @@ class ToolCheckoutsController < ApplicationController
     checkouts = ToolCheckout.where(member_id: current_member.id)
 
     # Optional active/revoked filter (mirrors admin controller behaviour)
-    checkouts = checkouts.where(revoked_at: nil)       if params[:active] == "true"
+    checkouts = checkouts.valid_at       if params[:active] == "true"
     checkouts = checkouts.where(:revoked_at.ne => nil) if params[:active] == "false"
+
+    checkouts = checkouts.filtered_status(params[:status]) if params[:status].present?
 
     # Optional shop filter — join through tool
     if params[:shop_id].present?
@@ -15,10 +17,13 @@ class ToolCheckoutsController < ApplicationController
       checkouts = checkouts.where(:tool_id.in => tool_ids)
     end
 
-    visible_tool_ids = Tool.where(:disabled.ne => true).pluck(:id)
-    checkouts = checkouts.where(:tool_id.in => visible_tool_ids)
+    unless ActiveModel::Type::Boolean.new.cast(params[:include_hidden])
+      visible_tool_ids = Tool.where(:disabled.ne => true).pluck(:id)
+      checkouts = checkouts.where(:tool_id.in => visible_tool_ids)
+    end
 
-    checkouts = checkouts.order_by(checked_out_at: :desc)
-    render json: checkouts, each_serializer: ToolCheckoutSerializer, adapter: :attributes
+    checkouts = checkouts.order_by(checked_out_at: :desc).to_a
+    render json: checkouts, each_serializer: ToolCheckoutSerializer, adapter: :attributes, scope: current_member,
+      checkout_context: CheckoutReadContext.for_checkouts(checkouts, current_member)
   end
 end

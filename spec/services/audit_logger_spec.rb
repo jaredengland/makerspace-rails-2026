@@ -45,6 +45,15 @@ RSpec.describe Service::AuditLogger do
         expect(log.slack_message).to include('revoked')
       end
 
+      it 'appends human-readable message details when provided' do
+        log = described_class.log(
+          **base_params,
+          message_details: 'shop: Woodshop, tool: Bandsaw'
+        )
+
+        expect(log.slack_message).to include('shop: Woodshop, tool: Bandsaw')
+      end
+
       it 'scrubs sensitive fields from before_snapshot' do
         before_snap = {
           'firstname'            => 'Jane',
@@ -147,6 +156,23 @@ RSpec.describe Service::AuditLogger do
         result = described_class.log(**base_params)
         expect(result).to be_nil
         expect(Honeybadger).to have_received(:notify)
+      end
+    end
+
+    describe '.notify_honeybadger' do
+      it 'filters sensitive context before writing to the Rails log' do
+        error = StandardError.new('Audit delivery failed')
+        context = { member_id: '123', token: 'super-secret-token' }
+        allow(Honeybadger).to receive(:notify)
+
+        expect(Rails.logger).to receive(:error) do |message|
+          expect(message).to include('member_id', '123', '[FILTERED]')
+          expect(message).not_to include('super-secret-token')
+        end
+
+        described_class.notify_honeybadger(error, context: context)
+
+        expect(Honeybadger).to have_received(:notify).with(error, context: context)
       end
     end
 

@@ -49,7 +49,23 @@ RSpec.describe Member, type: :model do
         expect(member.errors[:role]).not_to be_empty
       end
     end
-    it { is_expected.to validate_uniqueness_of(:email) }
+
+    it "accepts pending as a valid member status" do
+      expect(build(:member, status: 'pending')).to be_valid
+    end
+    # Not validate_uniqueness_of(:email) -- that matcher looks for a
+    # registered uniqueness validator by type, but email uniqueness is
+    # deliberately enforced by a custom validate method instead (see
+    # validate_email_not_taken_by_an_active_member and the "soft delete"
+    # describe block below), so the duplicate-email behavior is exercised
+    # there instead of via type introspection here.
+    it "rejects a duplicate email" do
+      create(:member, email: "duplicate@example.com")
+      duplicate = build(:member, email: "duplicate@example.com")
+
+      expect(duplicate).not_to be_valid
+      expect(duplicate.errors[:email]).to include("has already been taken")
+    end
     it { is_expected.to have_many(:access_cards).as_inverse_of(:member) }
   end
 
@@ -104,10 +120,17 @@ RSpec.describe Member, type: :model do
   end
 
   describe ".search" do
-    let(:criteria) { double("scoped criteria") }
+    let(:selector) do
+      Member.where(id: BSON::ObjectId.new, status: 'activeMember',
+        :expirationTime.gt => Time.now.to_i * 1000).selector
+    end
+    let(:criteria) { instance_double(Mongoid::Criteria, selector: selector) }
+    let(:collection) { instance_double(Mongo::Collection) }
 
     before do
-      allow(Member).to receive_message_chain(:collection, :aggregate)
+      allow(Member).to receive(:collection).and_return(collection)
+      allow(collection).to receive(:aggregate)
+        .with(array_including({ :$match => selector }))
         .and_raise(Mongo::Error::OperationFailure.new("Atlas Search unavailable"))
     end
 
@@ -147,13 +170,53 @@ RSpec.describe Member, type: :model do
       second_member = double("second member", id: BSON::ObjectId.new)
       result_ids = [first_member.id, second_member.id]
 
-      allow(Member).to receive_message_chain(:collection, :aggregate)
+      allow(collection).to receive(:aggregate)
+        .with(array_including({ :$match => selector }))
         .and_return(result_ids.map { |id| { _id: id } })
       expect(criteria).to receive(:where)
         .with(id: { :$in => result_ids })
         .and_return([second_member, first_member])
 
       expect(Member.search("smith", criteria)).to eq([first_member, second_member])
+    end
+  end
+
+  describe "signup source" do
+    it "stores blank answers as nil and keeps the typed name only for class and friend" do
+      member = build(:member, signup_source: "", signup_source_detail: "Intro to Welding")
+      expect(member).to be_valid
+      expect(member.signup_source).to be_nil
+      expect(member.signup_source_detail).to be_nil
+
+      %w[class friend].each do |source|
+        member.signup_source = source
+        member.signup_source_detail = "Intro to Welding"
+        expect(member).to be_valid
+        expect(member.signup_source_detail).to eq("Intro to Welding")
+      end
+    end
+
+    it "links a referring member only for friend, and never to the member themself or a missing member" do
+      referrer = create(:member)
+      member = create(:member, signup_source: "friend", referred_by_member_id: referrer.id)
+      expect(member.reload.referred_by_member_id).to eq(referrer.id)
+
+      member.signup_source = "website"
+      member.valid?
+      expect(member.referred_by_member_id).to be_nil
+
+      member.assign_attributes(signup_source: "friend", referred_by_member_id: member.id)
+      expect(member).not_to be_valid
+      member.referred_by_member_id = BSON::ObjectId.new
+      expect(member).not_to be_valid
+    end
+
+    it "rejects a new unknown source but allows saving a member whose stored source was retired" do
+      expect(build(:member, signup_source: "billboard")).not_to be_valid
+
+      member = create(:member)
+      member.set(signup_source: "retired_choice")
+      expect(member.reload).to be_valid
     end
   end
 
@@ -166,6 +229,14 @@ RSpec.describe Member, type: :model do
     let(:member) { create(:member) }
     let(:expired_member) { create(:member, :expired) }
     let(:expired_card) { create(:card, member: expired_member) }
+
+    it "treats a current pending member as active for general membership checks" do
+      pending_member = build(:member, :current, status: 'pending')
+
+      expect(pending_member.active_membership_status?).to be(true)
+      expect(pending_member.active_unexpired?).to be(true)
+      expect(pending_member.fully_active_unexpired?).to be(false)
+    end
 
     describe "Renewing members" do
       it "Adds renewal to Now if member is expired" do
@@ -283,14 +354,10 @@ RSpec.describe Member, type: :model do
 
   context "Callbacks" do
     describe "on create" do
-      it "schedules a slack and google drive invite" do
+      it "schedules only the signup Slack invite" do
         member = build(:member)
-        allow(MemberSubscriber).to receive(:send_google_invite).and_return(nil)
-        expect(MemberSubscriber).to receive(:invite_to_slack).with(
-          member.email,
-          member.lastname,
-          member.firstname,
-        )
+        expect(Service::MemberProvisioning).to receive(:invite_slack).with(member)
+        expect(MemberSubscriber).not_to receive(:send_google_invite)
         member.save!
       end
     end
@@ -301,7 +368,7 @@ RSpec.describe Member, type: :model do
       let(:expired_member) { create(:member, :expired) }
       let(:expired_card) { create(:card, member: expired_member) }
 
-      it "Updates access card expiration" do
+      it "Updates access card expiration", requires_transactions: true do
         first_expiration = expired_member.expirationTime
         expect(expired_card.expiry).to eq(first_expiration)
 
@@ -317,43 +384,58 @@ RSpec.describe Member, type: :model do
         member.update!({ firstname: "foo_changed" })
       end
 
+      it "syncs the Braintree customer when firstname or lastname changes" do
+        expect do
+          member.update!({ firstname: "foo_changed" })
+        end.to have_enqueued_job(BraintreeCustomerSyncJob).with(member.id.to_s)
+      end
+
+      it "syncs the Braintree customer when email changes" do
+        expect do
+          member.update!({ email: "foo_changed@test.com" })
+        end.to have_enqueued_job(BraintreeCustomerSyncJob).with(member.id.to_s)
+      end
+
+      it "does not sync the Braintree customer for unrelated changes" do
+        expect do
+          member.update!({ phone: "9995551234" })
+        end.not_to have_enqueued_job(BraintreeCustomerSyncJob)
+      end
+
       it "does not reinvite services if email changes and invalidates external auth/session state" do
         new_email = "foo_changed@test.com"
+        previous_email = member.email
+        previous_slack_user = SlackUser.create!(
+          member: member,
+          slack_email: previous_email,
+          slack_id: 'U_PREVIOUS'
+        )
         member.set(firebase_uid: "firebase-123", session_token: "old-token")
 
         expect(MemberSubscriber).not_to receive(:send_google_invite)
         expect(MemberSubscriber).not_to receive(:send_slack_invite)
 
-        member.update!({ email: new_email })
+        expect do
+          member.update!({ email: new_email })
+        end.to have_enqueued_job(MemberProvisioningJob).with(member.id.to_s)
 
         member.reload
         expect(member.firebase_uid).to be_nil
         expect(member.session_token).to be_present
         expect(member.session_token).not_to eq("old-token")
+        expect(member.google_previous_email).to eq(previous_email)
+        expect(member.slack_previous_user_id).to eq(previous_slack_user.id)
       end
 
-      it "Updates billing if a customer" do 
-        allow(MemberSubscriber).to receive(:send_google_invite).and_return(nil)
-        allow(MemberSubscriber).to receive(:invite_to_slack).and_return(nil)
-        customer = create(:member, customer_id: "foo")
-        mock_customer_chain = double
-        # The subscriber's connect_gateway instance method delegates to
-        # ::Service::BraintreeGateway.connect_gateway — stub the class-level method
-        allow(Service::BraintreeGateway).to receive(:connect_gateway).and_return(gateway)
-        expect(gateway).to receive(:customer).and_return(mock_customer_chain)
-        expect(mock_customer_chain).to receive(:update).with(
-          "foo", 
-          first_name: "foo_changed", 
-          last_name: customer.lastname
-        )
-        customer.update!({ firstname: "foo_changed" })
+      it "enqueues MemberProvisioningJob exactly once when expirationTime changes, regardless of how many cards the member holds" do
+        create(:card, member: member)
+        create(:card, member: member)
+
+        expect do
+          member.update!({ expirationTime: (Time.now + 1.month).to_i * 1000 })
+        end.to have_enqueued_job(MemberProvisioningJob).with(member.id.to_s).exactly(1).times
       end
 
-      it "Doesn't update billing if not a customer" do 
-        allow_any_instance_of(Service::BraintreeGateway).to receive(:connect_gateway).and_return(gateway)
-        expect(gateway).not_to receive(:customer)
-        member.update!({ firstname: "foo_changed" })
-      end
 
     it "disbands the household when the primary renews with an individual member invoice" do
       primary = create(:member, expirationTime: 1.month.from_now.to_i * 1000)
@@ -550,6 +632,33 @@ RSpec.describe Member, type: :model do
     end
   end
 
+  if ENV['RUN_OPTIONAL_CHECKOUT_CANVAS_SPECS'] == 'true'
+    describe "checkout canvas synchronization" do
+      it "refreshes each affected shop canvas after membership eligibility changes" do
+        member = create(:member, :current)
+        first_shop = create(:shop)
+        second_shop = create(:shop)
+        ToolCheckout.create!(member: member, tool: create(:tool, shop: first_shop))
+        ToolCheckout.create!(member: member, tool: create(:tool, shop: second_shop))
+
+        expect {
+          member.update!(status: "revoked")
+        }.to have_enqueued_job(ToolCheckoutSlackCanvasSyncJob)
+          .with(first_shop.id.to_s).once
+          .and have_enqueued_job(ToolCheckoutSlackCanvasSyncJob)
+          .with(second_shop.id.to_s).once
+      end
+
+      it "does not refresh checkout canvases after unrelated member changes" do
+        member = create(:member, :current)
+
+        expect {
+          member.update!(firstname: "Updated")
+        }.not_to have_enqueued_job(ToolCheckoutSlackCanvasSyncJob)
+      end
+    end
+  end
+
   describe "#timeout_in" do
     # Overrides Devise::Models::Timeoutable#timeout_in to look up the idle
     # session timeout fresh from SystemConfig on every call, rather than a
@@ -577,6 +686,108 @@ RSpec.describe Member, type: :model do
     it "falls back to 30 minutes when the configured value is not a valid integer" do
       SystemConfig.set('devise_timeout_minutes', 'not-a-number')
       expect(create(:member).timeout_in).to eq(30.minutes)
+    end
+  end
+
+  describe "#household_role" do
+    it "returns nil when groupName is blank" do
+      member = create(:member, groupName: nil)
+      expect(member.household_role).to be_nil
+    end
+
+    it "returns nil when groupName is an empty string" do
+      member = create(:member, groupName: "")
+      expect(member.household_role).to be_nil
+    end
+
+    it "returns :primary when groupName is the member's own id" do
+      member = create(:member)
+      member.update_attribute(:groupName, member.id.to_s)
+      expect(member.household_role).to eq(:primary)
+    end
+
+    it "returns :secondary when groupName references another existing member" do
+      primary = create(:member)
+      secondary = create(:member, groupName: primary.id.to_s)
+      expect(secondary.household_role).to eq(:secondary)
+    end
+
+    # groupName predates the household feature and was also used as a
+    # free-text organizational/partner-group label (e.g. real production
+    # values like "Autodesk", "FRC Team", "GSWT" found via #313's
+    # investigation) -- those values are present and don't match the
+    # member's own id, so without checking that a real member actually
+    # exists at that id, household_role would misreport these as :secondary.
+    it "returns nil when groupName is a legacy label that isn't any real member's id" do
+      member = create(:member, groupName: "Autodesk")
+      expect(member.household_role).to be_nil
+    end
+
+    it "returns nil when groupName references a member id that no longer exists" do
+      orphaned_id = BSON::ObjectId.new.to_s
+      member = create(:member, groupName: orphaned_id)
+      expect(member.household_role).to be_nil
+    end
+  end
+
+  describe "soft delete (merged_at)" do
+    it "hides a soft-deleted member from default queries" do
+      active = create(:member)
+      ghost = create(:member)
+      ghost.update_attribute(:merged_at, Time.current)
+
+      expect(Member.where(id: active.id).first).to eq(active)
+      expect(Member.where(id: ghost.id).first).to be_nil
+      expect(Member.unscoped.where(id: ghost.id).first).to eq(ghost)
+    end
+
+    it "still finds a soft-deleted member by id via Member.find" do
+      ghost = create(:member)
+      ghost.update_attribute(:merged_at, Time.current)
+
+      expect(Member.find(ghost.id)).to eq(ghost)
+    end
+
+    it "allows a new member to reuse a soft-deleted member's email" do
+      email = generate(:email)
+      ghost = create(:member, email: email)
+      ghost.update_attribute(:merged_at, Time.current)
+
+      expect { create(:member, email: email) }.not_to raise_error
+    end
+
+    it "still rejects a duplicate email between two active members" do
+      email = generate(:email)
+      create(:member, email: email)
+
+      expect { create(:member, email: email) }.to raise_error(Mongoid::Errors::Validations)
+    end
+
+    describe "#eligible_for_soft_delete?" do
+      it "is eligible when status is not active" do
+        member = create(:member, status: "inactive")
+        expect(member.eligible_for_soft_delete?).to be true
+      end
+
+      it "is eligible when status is active but expirationTime has passed" do
+        member = create(:member, status: "activeMember", expirationTime: 1.day.ago.to_i * 1000)
+        expect(member.eligible_for_soft_delete?).to be true
+      end
+
+      it "is eligible when status is active (the default) but no expirationTime was ever set" do
+        member = create(:member, status: "activeMember", expirationTime: nil)
+        expect(member.eligible_for_soft_delete?).to be true
+      end
+
+      it "is not eligible when status is active and unexpired" do
+        member = create(:member, status: "activeMember", expirationTime: 1.day.from_now.to_i * 1000)
+        expect(member.eligible_for_soft_delete?).to be false
+      end
+
+      it "is not eligible when a live subscription exists regardless of status/expiration" do
+        member = create(:member, status: "inactive", subscription: true, expirationTime: 1.day.ago.to_i * 1000)
+        expect(member.eligible_for_soft_delete?).to be false
+      end
     end
   end
 end

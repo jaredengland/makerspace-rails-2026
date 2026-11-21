@@ -11,14 +11,14 @@ class RentalMailer < ApplicationMailer
   def rental_request_approved(member_id, rental_id)
     @member      = Member.find(member_id)
     @rental      = Rental.find(rental_id)
-    @profile_url = "#{Rails.configuration.action_mailer.default_url_options[:host]}/members/#{@member.id}/invoices"
+    @profile_url = "#{Rails.configuration.x.app_base_url}/members/#{@member.id}/invoices"
     mail(to: @member.email, subject: "Your Rental Request Has Been Approved — Manchester Makerspace")
   end
 
   def rental_claimed(member_id, rental_id)
     @member      = Member.find(member_id)
     @rental      = Rental.find(rental_id)
-    @profile_url = "#{Rails.configuration.action_mailer.default_url_options[:host]}/members/#{@member.id}/invoices"
+    @profile_url = "#{Rails.configuration.x.app_base_url}/members/#{@member.id}/invoices"
     mail(to: @member.email, subject: "Rental Claimed — Payment Required — Manchester Makerspace")
   end
 
@@ -33,6 +33,19 @@ class RentalMailer < ApplicationMailer
     @member = Member.find(member_id)
     @rental = Rental.find(rental_id)
     mail(to: @member.email, subject: "Your Rental Has Ended — Manchester Makerspace")
+  end
+
+  # The member's membership has ended but a rental is still active. See RentalLapseNotifier.
+  def membership_lapsed(member_id, reason, rental_ids)
+    @member      = Member.find(member_id)
+    reason       = reason.to_sym
+    rentals      = Rental.where(:id.in => rental_ids, status: "active").to_a
+    @spaces      = rentals.map { |rental| RentalLapseNotifier.describe(rental) }
+    @reason_text = RentalLapseNotifier::REASONS.fetch(reason)[:member]
+    @can_renew   = !RentalLapseNotifier::UNREACHABLE_REASONS.include?(reason)
+    @profile_url = RentalLapseNotifier.profile_url(@member)
+    @help_url    = RentalLapseNotifier::WIKI_URL
+    mail(to: @member.email, subject: "Your Membership Has Ended but You Still Have a Rental — Manchester Makerspace")
   end
 
   def rental_vacating(member_id, rental_id, expiry)

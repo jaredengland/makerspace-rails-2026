@@ -5,14 +5,42 @@ class MemberSerializer < MemberSummarySerializer
              :subscription,
              :subscription_id,
              :earned_membership_id,
+             :earned_membership_active,
              :customer_id,
              :address,
              :phone,
              :silence_emails,
+             :signup_source,
+             :signup_source_detail,
+             :signup_eventbrite_event_id, :signup_eventbrite_event_snapshot, :signup_source_prompt_pending,
              :member_contract_on_file,
              :group_name,
              :household_role,
              :subscription_plan_id
+
+  attribute :expiring_payment_card_types, if: :include_expiring_payment_card_types?
+  # Admin/board only: the member staff linked as having referred this one.
+  attribute :referred_by_member_id, if: :include_provisioning?
+  attribute :referred_by_member_name, if: :include_provisioning?
+  # Admin/board only (same audience as provisioning): a household-plan member with no household yet.
+  attribute :household_setup_needed, if: :include_provisioning?
+  # Admin/board only (same audience as provisioning): rentals still marked active, so staff
+  # can see them before ending a membership and after it has ended (#276).
+  attribute :active_rentals, if: :include_provisioning?
+  # Tells the portal to show the Issue Fob screen. Sign-in and session responses render
+  # the member without a viewer, so this is always included (the payload is only returned
+  # to the member themself or to staff).
+  attribute :is_fob_issuer
+
+  def is_fob_issuer
+    object.fob_issuer?
+  end
+
+  def referred_by_member_name
+    return if object.referred_by_member_id.blank?
+
+    Member.unscoped.where(id: object.referred_by_member_id).first&.fullname
+  end
 
   def totp_enabled
     object.otp_required_for_login? && object.otp_secret_encrypted.present?
@@ -23,12 +51,31 @@ class MemberSerializer < MemberSummarySerializer
     active_card && active_card.id
   end
 
+  # Presence-based, deliberately -- keeps report/requirement history (and the
+  # Reports tab) visible on the member's profile regardless of status.
   def earned_membership_id
     object.earned_membership && object.earned_membership.id
   end
 
+  # Status-based, unlike earned_membership_id above -- used to decide whether
+  # the member is *currently* covered by an earned membership (e.g. the
+  # self-service Membership panel), which a suspended record no longer is.
+  def earned_membership_active
+    !!object.earned_membership&.active?
+  end
+
   def group_name
     object.groupName
+  end
+
+  def active_rentals
+    RentalLapseNotifier.active_rentals(object).map do |rental|
+      { id: rental.id.to_s, number: rental.number, description: RentalLapseNotifier.describe(rental), billing: rental.subscription_id.present? }
+    end
+  end
+
+  def household_setup_needed
+    object.household_setup_needed?
   end
 
   def household_role
@@ -39,6 +86,17 @@ class MemberSerializer < MemberSummarySerializer
     return nil unless object.subscription_id
     invoice = Invoice.find_by(subscription_id: object.subscription_id)
     invoice&.plan_id
+  end
+
+  def expiring_payment_card_types
+    @expiring_payment_card_types ||= Service::CardExpirationCheck.card_types_for_member(object.id)
+  end
+
+  def include_expiring_payment_card_types?
+    viewer = instance_options[:viewer]
+    return false unless viewer
+    authorized = viewer.id == object.id || %w[admin board_member].include?(viewer.role)
+    authorized && expiring_payment_card_types.present?
   end
 
   def address

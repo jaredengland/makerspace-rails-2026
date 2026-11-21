@@ -1,10 +1,14 @@
 class ToolCheckoutRequestsController < AuthenticationController
+  include CatalogUnavailable
+  prepend_before_action { response.set_header("Cache-Control", "private, no-store") }
+
   before_action :find_request, only: [:update, :destroy]
 
   def index
-    requests = ToolCheckoutRequest.where(member_id: current_member.id, status: "open")
-    visible_tool_ids = Tool.where(:disabled.ne => true).pluck(:id)
-    requests = requests.where(:tool_id.in => visible_tool_ids)
+    requests = CheckoutInteractionQuery.new(member: current_member).open_requests
+    if params[:include_groups] == 'true'
+      requests = requests.to_a + CheckoutInteractionQuery.new(member: current_member).visible_group_requests.select { |request| request.member_id == current_member.id }
+    end
 
     requests = ToolCheckoutRequest.table_query(requests, params)
     response.set_header("total-items", requests.count)
@@ -15,50 +19,56 @@ class ToolCheckoutRequestsController < AuthenticationController
   end
 
   def create
-    raise ::Error::Forbidden.new unless current_member.active_unexpired?
-
-    tool = Tool.find(request_params[:tool_id])
-    raise ::Error::Forbidden.new if tool.disabled?
-    raise ::Error::UnprocessableEntity.new("A checkout record already exists for this tool") if ToolCheckout.where(member_id: current_member.id, tool_id: tool.id).exists?
-    raise ::Error::UnprocessableEntity.new("An open request already exists for this tool") if ToolCheckoutRequest.where(member_id: current_member.id, tool_id: tool.id, status: "open").exists?
-
-    request = ToolCheckoutRequest.create!(
-      member_id: current_member.id,
-      tool_id: tool.id,
-      note: request_params[:note],
-      request_date: Time.now,
-      status: "open"
-    )
-    request.announce_request
+    if request_params[:tool_group_id].present?
+      raise Error::UnprocessableEntity.new('Choose exactly one tool or group') if request_params[:tool_id].present?
+      group = ToolGroup.find(request_params[:tool_group_id]) || raise(Error::NotFound.new)
+      request = ToolGroupCheckout.request!(member: current_member, group: group, note: request_params[:note])
+      return render json: request, serializer: ToolCheckoutRequestSerializer, adapter: :attributes
+    end
+    tool, = PublicCatalog.tool(request_params[:tool_id], public_only: false)
+    request = CheckoutRequestCreation.create!(member_id: current_member.id, tool_id: tool.id,
+      shop_id: tool.shop_id, note: request_params[:note])
 
     render json: request, serializer: ToolCheckoutRequestSerializer, adapter: :attributes
   end
 
   def update
-    raise ::Error::Forbidden.new unless @request.member_id.to_s == current_member.id.to_s && @request.open?
-    raise ::Error::Forbidden.new if @request.tool.try(:disabled?)
-
-    @request.update_attributes!(request_params.slice(:note))
+    mutate_request! { @request.update_attributes!(request_params.slice(:note)) }
     render json: @request, serializer: ToolCheckoutRequestSerializer, adapter: :attributes
   end
 
   def destroy
-    raise ::Error::Forbidden.new unless @request.member_id.to_s == current_member.id.to_s && @request.open?
-    raise ::Error::Forbidden.new if @request.tool.try(:disabled?)
-
-    @request.remove_announcement
-    @request.update_attributes!(status: "deleted")
+    mutate_request! { @request.update_attributes!(status: "deleted") }
+    CheckoutCreation.notify { @request.remove_announcement }
     render json: {}, status: 204
   end
 
   private
 
+  def mutate_request!
+    mutation = proc do
+      @request.reload
+      raise Error::Forbidden.new unless @request.member_id == current_member.id && @request.open?
+      tool = @request.target
+      raise Error::Forbidden.new unless tool && !tool.disabled? && tool.shop && !tool.shop.disabled?
+      yield
+    end
+    if @request.tool_group_id
+      ToolGroupCheckout.with_request_locks(@request, &mutation)
+    else
+      CatalogMutationLock.with([@request.target&.shop_id]) do
+        CheckoutMutationLock.with(member_id: @request.member_id, tool_id: @request.tool_id, &mutation)
+      end
+    end
+  end
+
   def request_params
-    params.permit(:tool_id, :note)
+    params.permit(:tool_id, :tool_group_id, :note)
   end
 
   def find_request
     @request = ToolCheckoutRequest.find(params[:id])
+    raise Error::NotFound.new unless @request
   end
 
 end

@@ -1,0 +1,155 @@
+# Email sent by the Rails interface
+
+<!-- markdownlint-disable MD013 -->
+
+This document inventories email that the Rails application can initiate. “Template” below means the Action Mailer view used to build the message; where an editable Google Doc is supported, the environment-variable name selecting that document is also shown.
+
+## Delivery and suppression rules
+
+- Continuous paid membership accounting sends no new email. Successful portal
+  refunds retain the existing refund mail recipient, subject and template below;
+  membership refund accounting commits before that mail is queued. Settled refund
+  notifications, explicit reconciliation, offline refund recording, reset sweeps,
+  backfill and Admin balance corrections send no refund/counter mail. A processor
+  refund followed by accounting failure requires reconciliation before attempting
+  another refund. Household disband notifications retain their existing recipients,
+  subjects and templates and are deferred until an accounting transaction commits.
+
+- Application mail is sent from `SMTP_FROM` (default `contact@manchestermakerspace.org`). Production delivers through Gmail when `GMAIL_USERNAME` is present, otherwise generic SMTP when `SMTP_USERNAME` is present; without either provider, delivery is disabled. See [the environment-variable inventory](environment-vars.MD) for configuration details.
+- Most messages are queued with `deliver_later`. Admin-created-member welcomes use `deliver_now`; the controller therefore waits for that message to be processed.
+- A member with direct notifications suppressed (for example a revoked member) receives no mail through `ApplicationMailer`.
+- A **soft-deleted** member (see `Service::MemberSoftDelete`) also receives no mail through `ApplicationMailer`. The mailer still loads them by id, so a message queued before the delete is built, but `ApplicationMailer#suppress_member_delivery` turns delivery off when the recipient address belongs only to a soft-deleted member. If a live member now holds the same address (a soft delete frees the email for reuse), mail to it is sent normally. Suppressed messages are not recorded in the Mailtrap email log or the member audit trail (`MailtrapMessageObserver` skips a message whose delivery was turned off).
+- A household secondary does not ordinarily receive `MemberMailer` messages. The password-changed, admin-password-reset, signed-document, contract-updated, document-request, and household-disbanded actions are exceptions. Billing and rental messages are not filtered merely because the recipient is a household secondary.
+- `silence_emails` suppresses `MarketingMailer` mail, but does **not** suppress transactional member, billing, or rental mail.
+- Devise password-reset mail inherits directly from `Devise::Mailer`, rather than `ApplicationMailer`, and consequently does not use the application suppression callback.
+- When Mailtrap reports a hard failure (`bounce`, `reject` or `suspension`) for a member's address, the member receives a Slack DM (not email) and the member relations channel is told. See [Email bounce alerts](jobs-tasks-services.MD#email-bounce-alerts).
+
+## Editable-template behavior
+
+The mailers marked **editable** ask `Service::EmailTemplate` for HTML exported from the Google Doc named by the listed environment variable. A valid export is cached in Redis. If the variable/document is unavailable or invalid, most mailers fall back to their conventional Action Mailer view. The household-disbanded mailer explicitly asks the template service to render its packaged external-template fallback and always sends the result through `shared/google_doc_email`.
+
+Common member and portal placeholders, plus the per-template placeholders listed in `Service::EmailTemplate::TEMPLATE_DEFINITIONS`, are interpolated into editable documents. The subject lines are fixed in Ruby and are not controlled by the Google Doc.
+
+## Signup, account, and membership email
+
+| Circumstance | Recipient and subject | Template |
+| --- | --- | --- |
+| A visitor submits an email to begin self-registration (`RegistrationsController#new`), or an unused `RegistrationToken` is created. Existing member addresses are rejected by the self-registration endpoint rather than emailed. | The submitted address; **Welcome to Manchester Makerspace!** | **Editable:** `EMAIL_WELCOME_ID` (`welcome_email`). Falls back to `member_mailer/welcome_email`; a packaged default also exists for restoring the external document. |
+| The visitor completes self-registration and the pending member record is created. This is a second, distinct signup email and CCs `contact@manchestermakerspace.org`. | New pending member; **Thank you for registering _Full Name_** | **Editable:** `EMAIL_MEMBER_REGISTERED_ID` (`member_registered`). Falls back to `member_mailer/member_registered`. |
+| An administrator creates a member. Rails generates and stores a Devise reset token and immediately sends the welcome/set-password link. | New member; **Welcome to Manchester Makerspace!** | **Editable:** `EMAIL_WELCOME_MANUAL_ID` (`welcome_email_manual_register`). Falls back to `member_mailer/welcome_email_manual_register`. |
+| An administrator uses “send password reset,” or a member uses the normal Devise password-recovery flow. Devise only sends when its recoverable lookup/validation permits it. | Member; Devise's reset-password subject (normally **Reset password instructions**). | `devise/mailer/reset_password_instructions`; not an editable Google Doc. |
+| An administrator directly sets a member's password. This is a notification after the password has already changed, not a reset link. | Member; **Your Manchester Makerspace password has been changed** | **Editable:** `EMAIL_PASSWORD_CHANGED_ID` (`password_changed`). Falls back to `member_mailer/password_changed`. Devise's automatic password-change notification is not enabled, so ordinary password changes do not independently send this message. |
+| An authenticated member changes their own password directly. | **No email is sent.** The change is recorded in the audit log only. | None. |
+| A member successfully signs the membership contract or rental agreement and the background upload job verifies the document. If a retry finds a Drive file tagged with this upload job's ID, it reads back that archived PDF for the attachment instead of uploading (or rendering) another copy, then sends this message. A same-day file from an earlier signing does not qualify. | Signing member, with the signed PDF attached; **Manchester Makerspace - Signed _Document Type_** | `member_mailer/send_document`; not editable. |
+| The weekly/admin-runnable member review actually executes (in production its Rake task proceeds only on Sunday) and finds that a member with a linked Slack identity lacks a signed Member Contract or Rental Agreement. One email is queued for each applicable missing contract. Members without a linked `SlackUser` are included in the management report but are not emailed by this task. | Member missing the contract; **Action Required - Manchester Makerspace** | `member_mailer/request_document`; not editable. The view names the missing `Member Contract` or `Rental Agreement` and links to that member's profile. Revoked and suspended members are suppressed, but household secondary members do receive it: they need a signed Member Contract before they can request any checkout, so `request_document` is on the secondary exemption list. |
+| A household membership is disbanded. Each former secondary and the primary receive separate transactional messages. | Each affected member; **Manchester Makerspace Household Membership Update** | **Editable:** primary uses `EMAIL_HOUSEHOLD_DISBANDED_PRIMARY_ID`; secondary uses `EMAIL_HOUSEHOLD_DISBANDED_SECONDARY_ID`. Packaged fallbacks are `external_templates/household_disbanded_primary_email` and `external_templates/household_disbanded_secondary_email`, rendered through `shared/google_doc_email`. |
+| A first key fob/access card is assigned. | **No email is sent by fob activation itself.** The card activates a pending member, settles already-paid open membership invoices, and queues member provisioning. Any receipt was sent when payment was submitted/processed, rather than when the fob later activates membership. | None. |
+| `MembershipExpirationNoticeJob` runs daily and finds an active member with no Braintree subscription (`subscription_id` blank and `subscription` not true, including via a covering household subscription) and no active Earned Membership, whose `expirationTime` falls exactly 3 days out. Existing subscription-driven renewal/failed-payment emails never reach this population, since there's no subscription for Braintree to send a webhook about. | Member; **Your Manchester Makerspace membership expires soon**. A member with a linked `SlackUser` also receives a matching Slack DM. | **Editable:** `EMAIL_MEMBERSHIP_EXPIRING_SOON_ID` (`membership_expiring_soon`), falling back to `external_templates/membership_expiring_soon`, rendered through `shared/google_doc_email`. Sent at most once per expiration (tracked via `membership_expiring_soon_notice_sent_for`, which resets automatically on renewal). The Slack DM text is fixed in Ruby, not the Google Doc. |
+| The same job finds a member in the same non-subscribed, non-earned population whose `expirationTime` fell exactly 1 day ago. | Member; **Your Manchester Makerspace membership has expired**. A member with a linked `SlackUser` also receives a matching Slack DM. | **Editable:** `EMAIL_MEMBERSHIP_EXPIRED_ID` (`membership_expired`), falling back to `external_templates/membership_expired`, rendered through `shared/google_doc_email`. Sent at most once per expiration (tracked via `membership_expired_notice_sent_for`). The Slack DM text is fixed in Ruby, not the Google Doc. |
+| `MemberReminderJob` (job key `member_reminders`) runs daily with the **fob reminder** switched on (`fob_reminder_enabled`, off by default). It finds a `pending` or `activeMember` account with no access card whose first member payment (earliest paid member invoice, by invoice creation date) was 8 or more days ago (the `fob_reminder_days` setting, default 7, plus one) and not more than 30 days ago, and whose payments are not all refunded or refund-requested. Landlord and active Earned Membership accounts are skipped. | Member; **Your Manchester Makerspace membership is paid. Come get your key fob**. A member with a linked `SlackUser` also receives a matching Slack DM. | **Editable:** `EMAIL_FOB_REMINDER_ID` (`fob_reminder`; placeholder `paid_date` plus the common variables), falling back to `external_templates/fob_reminder`, rendered through `shared/google_doc_email`. Exactly two reminders: the first when due, the second 14 days after it (each run sends at most one per member, and the second never sooner than 14 days after the first), tracked by `fob_reminder_count` and `fob_reminder_last_sent_at`. An account email, so it ignores `silence_emails`. The Slack DM text is fixed in Ruby. |
+| The same job with the **signup reminder** switched on (`signup_reminder_enabled`, off by default). It finds a `pending` member (never `activeMember`, so older accounts are not reached) with no access card and no member invoice at all, who signed up 8 or more days ago (the `signup_reminder_days` setting, default 7, plus one) and not more than 30 days ago. | Member; **Finish joining Manchester Makerspace**. A member with a linked `SlackUser` also receives a matching Slack DM. | **Editable:** `EMAIL_SIGNUP_REMINDER_ID` (`signup_reminder`; common variables only), falling back to `external_templates/signup_reminder`, rendered through `shared/google_doc_email`. Exactly two reminders, 14 days apart, tracked by `signup_reminder_count` and `signup_reminder_last_sent_at`. The text does not mention paying in person. An account email, so it ignores `silence_emails`. |
+| The primary of a household plan invites a second adult (**Invite** on their household page, `POST /api/household/invitations`, or a resend). Sent only to the address the primary typed, which may not belong to a member yet. | The invited address; **<Primary first name> invited you to a Manchester Makerspace household membership**. Contains the personal link (`/household/join#token=...`, valid 14 days, only a digest of its token is stored; sent by `HouseholdInvitationMailJob`, which does not log its arguments, and limited to one email a minute per recipient and 10 a day per sender), says joining is free, that the address on the account must match the household's, and that the second adult must come in person with photo ID to get a fob. It never contains the household address. | **Editable:** `EMAIL_HOUSEHOLD_INVITATION_ID` (`household_invitation`; placeholders `primary_name`, `invite_url`, `expires_on`), falling back to `external_templates/household_invitation`, rendered through `shared/google_doc_email`. |
+| A second adult joins a household by invitation (`POST /api/household/invitations/accept`). | Both adults, each separately; **Your Manchester Makerspace household membership**. Names the other adult and says each adult must come in person with photo ID for their fob. | **Editable:** `EMAIL_HOUSEHOLD_JOINED_ID` (`household_joined`; placeholder `other_member_name`), falling back to `external_templates/household_joined`. |
+
+`MemberMailer#contract_updated` (updated code-of-conduct attachment) is sent only by the manual `documents:send_update_notice` Rake task (see "Manual operator Rake tasks" in `jobs-tasks-services.MD`); it is not part of any automatic lifecycle. Household secondary members receive it, because the updated contract applies to them too. `MemberMailer#admin_password_reset` (a legacy custom reset-link message) has a conventional view, but there is currently no production call site. `MarketingMailer#request_signup` similarly has a conventional `marketing_mailer/request_signup` view but is currently used only by previews/tests. `admin_password_reset` and `request_signup` must not be treated as automatically sent lifecycle messages unless a production caller is added.
+
+## Payments, subscriptions, refunds, and disputes
+
+| Circumstance | Recipient and subject | Template |
+| --- | --- | --- |
+| A new Braintree subscription is successfully created for a membership or rental. A receipt is also queued for the initial transaction. | Member; **Subscription to Manchester Makerspace** | **Editable:** `EMAIL_NEW_SUBSCRIPTION_ID` (`new_subscription`), falling back to `billing_mailer/new_subscription`. |
+| A one-time transaction is submitted successfully, or a successful subscription-charge/settlement webhook is processed. | Member; **Receipt from Manchester Makerspace** | `billing_mailer/receipt`; not editable. Duplicate webhook handling is designed not to issue an additional receipt. |
+| Braintree reports `SubscriptionChargedUnsuccessfully`. This happens on the first failed recurring attempt and again for any later unsuccessful-attempt webhook Braintree sends. Rails does not select a different template based on “first” versus “second” failure. | Member; **Failed payment to Manchester Makerspace** | **Editable:** `EMAIL_FAILED_PAYMENT_ID` (`failed_payment`), falling back to `billing_mailer/failed_payment`. The Braintree transaction status is inserted as `error_status`, and the stored reason as `failure_reason` (see below). |
+| Braintree reports `SubscriptionWentPastDue`, commonly after unsuccessful retries. This is a separate event and sends another failed-payment message with `error_status` set to `past_due` and the reason stored from the failed charge. | Member; **Failed payment to Manchester Makerspace** | The same editable/fallback failed-payment template as above. |
+| A member presses **Pay now** (`POST /api/billing/subscriptions/:id/pay_now`). | Nothing is emailed or direct-messaged for a decline or a refusal: the member sees the answer on the screen. A successful charge goes through the normal success handling, so the member gets the usual receipt (`billing_mailer/receipt`) and the Slack "payment successful" note. | See "Failed-payment wording and Pay now" below. Braintree may also send its own `SubscriptionChargedUnsuccessfully` for a declined manual retry, which then sends the failed-payment email above; the sandbox cannot show whether it does. |
+| Braintree reports `TransactionSettlementDeclined` for a transaction attached to an invoice. Rails reverses the invoice operation and emails the failure status. | Member; **Failed payment to Manchester Makerspace** | The same editable/fallback failed-payment template as above. |
+| Braintree cancels/expires a subscription, including cancellation after repeated payment failures, or application cancellation processing otherwise completes. Rails infers failure-driven cancellation when a last failed transaction was recorded and adds “after repeated failed payment attempts” to the message. | Member; **Canceled Manchester Makerspace Subscription** | **Editable:** `EMAIL_CANCELED_SUBSCRIPTION_ID` (`canceled_subscription`), falling back to `billing_mailer/canceled_subscription`. There is no special cancellation template solely for payment failures. |
+| A non-subscription rental invoice is created, or a one-off fee/shop-charge invoice is created. Recurring membership invoices do not send this message. | Member; **Makerspace dues require your attention** | `billing_mailer/new_invoice`; not editable. |
+| A member requests a refund. | Member; **Refund Requested for transaction _ID_** | `billing_mailer/refund_requested`; not editable. |
+| An administrator successfully processes a refund through the transaction service. | Member; **Refund Approved for transaction _ID_** | `billing_mailer/refund`; not editable. |
+| Braintree reports that a dispute was opened, won, or lost for a known invoice transaction. | Member; respectively **Dispute opened/won/lost for payment to Manchester Makerspace** | Respectively `billing_mailer/dispute_requested`, `billing_mailer/dispute_won`, or `billing_mailer/dispute_lost`; none is editable. An unknown transaction produces an operational notification, not member email. |
+
+### Failed-payment sequence
+
+There is no Rails counter that maps attempt one and attempt two to different email bodies. The observable sequence is driven by Braintree webhook kinds:
+
+1. Every charged-unsuccessfully notification sends the normal failed-payment email with that attempt's status.
+2. A went-past-due notification sends the same email again, labeled `past_due`.
+3. A later canceled/expired notification sends the canceled-subscription email. If an unsuccessful attempt was previously recorded on the invoice, the cancellation text identifies repeated failed attempts as the reason.
+
+The exact number of emails before cancellation therefore depends on which webhook events Braintree emits and delivers, rather than on an application rule such as “first failure template / second failure template.”
+
+
+### Failed-payment wording and Pay now
+
+When a recurring charge fails, `BraintreeService::Notification.process_subscription_charge_failure` first stores why on the invoice
+(`last_failure_type`, `last_failure_message`; see `mongodb-collections.MD`) and then writes the messages from it:
+
+- **Member email** (`failed_payment`): the new placeholder `failure_reason` is a complete sentence such as `Reason: insufficient funds.`, or an
+  empty string when the reason is not known, so the template can place it anywhere without leaving a dangling label. The fallback
+  template (`billing_mailer/failed_payment`) and the default document text (`external_templates/failed_payment_default`) show it and tell the
+  member to sign in to the portal and use **Pay now** (the banner at the top of the home page), or to update the payment method first after a
+  card was declined for good. The link goes to the portal home page (`portal_url`). **The Google Doc `EMAIL_FAILED_PAYMENT_ID` is owned by
+  whoever edits the templates: until they add `{{failure_reason}}` and the Pay now text it keeps working as before, without either.**
+  `BillingMailer.failed_payment` takes the reason as an optional fourth argument; the settlement-declined path passes none, because a stored
+  charge-failure reason does not describe a declined settlement.
+- **Member Slack DM** ("Your recurring payment for ... was unsuccessful" and the past-due notice): adds `Reason: ...` when known, and either
+  "open the member portal and use Pay now" or, after a hard decline, "this card cannot be tried again, so update your payment method in your
+  settings first".
+- **Members relations channel (board members)**: adds the reason, then the decline type and the bank's response in brackets, for example
+  `[soft declined, response 2001 (Insufficient Funds)]`. The raw response goes only to board members; member-facing text uses plain wording
+  (`PaymentFailure::MESSAGES_BY_CODE`) and never repeats the bank's own words. A failure whose reason cannot be worked out shows no reason
+  line rather than a guess.
+- **Pay now itself** (`PayNow`): a declined attempt posts the same kind of board member note to the members relations channel and writes a
+  `subscription_pay_now` audit entry, and sends the member nothing; a successful attempt posts a board member note, writes the audit entry and runs the
+  existing success handling (receipt, Slack note). Braintree's own "charged successfully" notification for that charge is then ignored
+  quietly (no "duplicate, skipping" note to the treasurer channel).
+
+## Rental workflow email
+
+| Circumstance | Recipient and subject | Template |
+| --- | --- | --- |
+| A member submits a rental request requiring approval. | `contact@manchestermakerspace.org`; **Rental Request Pending Approval — _Member_ / _Spot_** | `rental_mailer/rental_request_pending`. This operational email is not addressed to the member. |
+| An administrator approves a rental request. | Member; **Your Rental Request Has Been Approved — Manchester Makerspace** | `rental_mailer/rental_request_approved`. |
+| A member or administrator claims an available rental directly. | Member; **Rental Claimed — Payment Required — Manchester Makerspace** | `rental_mailer/rental_claimed`. The subsequently created invoice can also generate the new-invoice email documented above. |
+| An administrator denies a pending rental request. | Member; **Update on Your Rental Request — Manchester Makerspace** | `rental_mailer/rental_request_denied`. |
+| A member schedules cancellation/vacating, or cancellation is scheduled through the rental model. | Member; **Rental Cancellation Confirmation — Manchester Makerspace** | `rental_mailer/rental_vacating`. |
+| An admin ends a rental, or staff verify it is empty (**Verify Vacated**, or **Mark Vacated** on another member's vacating rental). A member saying they have vacated does not send it: that rental waits for verification, with a Slack DM to the member and a post to staff instead. | Member; **Your Rental Has Ended — Manchester Makerspace** | `rental_mailer/rental_ended`. |
+| A member's membership has ended (an admin revoked or suspended them, a membership subscription was cancelled, or the Sunday `member_review` finds it expired or cancelled) and they still have a rental marked `active`. | Member; **Your Membership Has Ended but You Still Have a Rental — Manchester Makerspace** | `rental_mailer/membership_lapsed`, sent by `RentalLapseNotifier`. It lists each space, says the rental keeps billing until cancelled, offers renewal first (not for revoked or suspended), explains Rentals tab > Cancel Rental and the board-member confirmation, and links the wiki's "End a rental" steps. Sent immediately on a subscription cancellation, and weekly only for members with no linked Slack account. Revoked and suspended members receive nothing, because the ApplicationMailer suppression applies. |
+
+All rental templates above are conventional Action Mailer HTML views and are not editable Google Docs.
+
+## Not email
+
+Several editable text templates registered beside the email templates—reservation reminders, volunteer-credit notices, member-review notices, and household-disbanded admin notices—are used to compose Slack messages. Their `DOC_*` variables and templates do not imply that Rails sends email for those events.
+
+## Repair tickets
+
+Tickets add no email notifications or email fallback. Ticket notifications are Slack DMs/channel messages. Reporter point nominations remain pending until independent approval; approval invokes existing volunteer-credit notification/accounting behavior with generic “Helpful tool report” text and no source-ticket identity mapping in shared messages.
+
+## Checkout expiration notices
+
+CheckoutExpirationNoticeJob (manual CLI or admin Run Now) calls
+CheckoutExpirationNotice and CheckoutMailer.expiration_notice. The dedicated
+mailer sends to the affected member's own email, including secondary household
+members; it does not use MemberMailer's household forwarding/suppression logic.
+Revoked/suspended members are suppressed. Other recipients must be active with
+an unexpired membership, or pending with the tool's allow_pending enabled.
+Missing Slack linkage does not block email.
+
+Subjects are “Manchester Makerspace — Your tool checkouts expire soon” and
+“Manchester Makerspace — Your tool checkouts have expired”. Local templates
+app/views/checkout_mailer/expiration_notice.html.erb and .text.erb list tool,
+shop, Eastern expiration date, the current training URL (if defined), and the Member
+Portal renewal link. Existing application mail transport/from configuration
+and APP_DOMAIN are reused; no external template or new variable is required.
+
+The first warning is due at the configured days before expiration (default 14,
+minimum 4), the second at 3 days, and the final after the expiration date. A
+late run sends only the most urgent applicable stage. Upcoming notices are
+grouped into one email/Slack DM per member; newly expired notices form a separate
+email/DM. Successful channels are recorded independently against the checkout's
+expiration revision. Changed dates clear state; unchanged dates preserve it.
+Retry failures without repeating recorded successes. A provider accepting a
+message followed by a lost acknowledgment can still cause a duplicate on retry;
+exactly-once external delivery cannot be guaranteed.

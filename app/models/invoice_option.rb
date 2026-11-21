@@ -3,6 +3,8 @@ class InvoiceOption
   include Mongoid::Search
   include ActiveModel::Serializers::JSON
 
+  PROMOTION_TIME_ZONE = "America/New_York".freeze
+
   ## Transaction Information
   # User friendly name for invoice displayed on receipt
   field :name, type: String
@@ -22,6 +24,9 @@ class InvoiceOption
 
   field :disabled, type: Boolean, default: false
   field :promotion_end_date, type: DateTime
+  # How many adults a household plan covers. The price is per plan, so the size is too. Blank on an existing household
+  # option means 2 (see #effective_household_size), so nothing changes until an admin sets it.
+  field :household_size, type: Integer
 
   search_in :name, :description
 
@@ -30,9 +35,40 @@ class InvoiceOption
   validates_numericality_of :amount, greater_than: 0
   validates_numericality_of :quantity, greater_than: 0
   validates_uniqueness_of :plan_id, unless: -> { plan_id.nil? }
+  validates_numericality_of :household_size, only_integer: true, greater_than_or_equal_to: 2, allow_nil: true
 
   def self.search(searchTerms, criteria = Mongoid::Criteria.new(InvoiceOption))
     criteria.full_text_search(searchTerms)
+  end
+
+  def self.signup_eligible(at: Time.current)
+    local_date = at.in_time_zone(PROMOTION_TIME_ZONE).to_date
+    promotion_cutoff = Time.utc(local_date.year, local_date.month, local_date.day)
+
+    # A blank plan_id means a one-time, non-recurring charge -- not "not
+    # publicly purchasable". Invoice#submit_for_settlement already treats a
+    # nil plan_id as a first-class case (it just skips building next month's
+    # invoice), so a real one-time membership option like "One Month
+    # Membership" belongs here alongside recurring ones.
+    where(disabled: false, resource_class: "member")
+      .any_of(
+        { promotion_end_date: nil },
+        { :promotion_end_date.gte => promotion_cutoff }
+      )
+  end
+
+  def household_plan?
+    plan_id.to_s.downcase.include?('household')
+  end
+
+  # nil for a plan that is not a household plan.
+  def effective_household_size
+    household_size || (household_plan? ? Group::DEFAULT_SIZE : nil)
+  end
+
+  def promotion_active?(at: Time.current)
+    promotion_end_date.present? &&
+      promotion_end_date.to_date >= at.in_time_zone(PROMOTION_TIME_ZONE).to_date
   end
 
   def build_invoice(member_id, due_date, resource_id, discount = nil)

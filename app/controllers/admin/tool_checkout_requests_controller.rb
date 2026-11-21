@@ -3,15 +3,10 @@ class Admin::ToolCheckoutRequestsController < ApplicationController
   before_action :authorize_view
 
   def index
-    requests = ToolCheckoutRequest.where(status: "open")
-
-    if can_view_disabled_tools?
-      requests = requests.where(:tool_id.in => Tool.all.pluck(:id))
-    else
-      approver_shop_ids = CheckoutApprover.shops_for_member(current_member.id).map(&:id)
-      tool_ids = Tool.where(:shop_id.in => approver_shop_ids, :disabled.ne => true).pluck(:id)
-      valid_member_ids = Member.all.select(&:active_unexpired?).map(&:id)
-      requests = requests.where(:tool_id.in => tool_ids, :member_id.in => valid_member_ids)
+    requests = CheckoutInteractionQuery.new(member: current_member).open_requests(for_approval: true)
+    if params[:include_groups] == 'true'
+      group_requests = CheckoutInteractionQuery.new(member: current_member).visible_group_requests
+      requests = requests.to_a + group_requests.select { |request| ToolGroupCheckout.authorized?(current_member, request.tool_group) }
     end
 
     requests = ToolCheckoutRequest.table_query(requests, params)
@@ -22,9 +17,19 @@ class Admin::ToolCheckoutRequestsController < ApplicationController
       adapter: :attributes
   end
 
+  # POST /api/admin/tool_checkout_requests/:id/decline  { reason: "..." }
+  def decline
+    request = ToolCheckoutRequest.find(params[:id])
+    raise ::Error::NotFound.new unless request
+
+    CheckoutRequestDecision.decline!(request: request, actor: current_member, reason: params[:reason])
+    render json: request, serializer: ToolCheckoutRequestSerializer, adapter: :attributes
+  end
+
   private
 
   def authorize_view
-    raise ::Error::Forbidden.new unless can_view_disabled_tools? || is_valid_checkout_approver?
+    raise ::Error::Forbidden.new unless is_admin? || is_board_member? ||
+      managed_shop_ids.present? || is_valid_checkout_approver?
   end
 end

@@ -1,10 +1,26 @@
 class Admin::CheckinsController < AuthenticationController
+  DEFAULT_LIMIT = 500
+
   def index
     checkins = checkins_collection.find(checkins_query).to_a
+    # timeOf/time are stored inconsistently as seconds or milliseconds per
+    # record (see CheckinTimeHelper), so a native Mongo sort on either raw
+    # field would interleave them out of chronological order. Normalize in
+    # Ruby before sorting/capping instead.
+    checkins = checkins.sort_by { |checkin| -(CheckinTimeHelper.normalize_to_seconds(checkin['timeOf'].presence || checkin['time']) || 0) }
+                        .first(result_limit)
     render json: { checkins: serialized_checkins(checkins) } and return
   end
 
   private
+
+  def result_limit
+    Integer(params[:limit] || DEFAULT_LIMIT).tap do |limit|
+      raise ::Error::UnprocessableEntity.new("Limit must be a positive integer") unless limit.positive?
+    end
+  rescue ArgumentError, TypeError
+    raise ::Error::UnprocessableEntity.new("Limit must be a positive integer")
+  end
 
   def checkins_collection
     Mongoid.default_client[:checkins]
@@ -76,13 +92,19 @@ class Admin::CheckinsController < AuthenticationController
     end
   end
 
+  # The frontend sends camelCase startTime/endTime, but the app-wide
+  # ActionController::ParamsNormalizer (config/initializers/wrap_parameters.rb)
+  # underscores every incoming param key before any controller code runs, so
+  # by the time we get here they're already start_time/end_time. Reading the
+  # camelCase keys here always returned nil, silently disabling the time
+  # filter entirely (see #206 for the production incident this caused).
   def query_start_time
-    return nil if params[:startTime].blank?
-    params[:startTime].to_i
+    return nil if params[:start_time].blank?
+    params[:start_time].to_i
   end
 
   def query_end_time
-    return nil if params[:endTime].blank?
-    params[:endTime].to_i
+    return nil if params[:end_time].blank?
+    params[:end_time].to_i
   end
 end

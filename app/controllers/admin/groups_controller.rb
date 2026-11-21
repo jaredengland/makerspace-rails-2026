@@ -39,8 +39,11 @@ class Admin::GroupsController < AdminController
       raise ::Error::UnprocessableEntity.new("Primary member must be on a household membership plan before creating a household")
     end
 
-    # Check primary is not already in a household
-    raise ::Error::UnprocessableEntity.new("Primary member is already part of a household") if primary.groupName.present?
+    # Check primary is not already in a household. household_role, not raw
+    # groupName -- groupName can hold a legacy, non-household value (see
+    # Member#household_role) that would otherwise falsely block ever
+    # creating a real household for this member.
+    raise ::Error::UnprocessableEntity.new("Primary member is already part of a household") if primary.household_role.present?
 
     group = Group.new(
       groupName: primary.id.to_s,
@@ -48,6 +51,7 @@ class Admin::GroupsController < AdminController
       expiry:    primary.expirationTime
     )
     group.save!
+    unpaid = !Group.payment_accepted_for?(primary)
 
     # Link primary member to the group
     primary.update_attributes!(groupName: primary.id.to_s)
@@ -59,8 +63,9 @@ class Admin::GroupsController < AdminController
       resource_id:    group.id,
       actor:          current_member,
       subject:        primary,
+      message_details: unpaid ? "The household payment had not been accepted yet and the admin continued" : nil,
       after_snapshot: { groupName: group.groupName, groupRep: group.groupRep,
-                        primary_member_id: primary.id.to_s },
+                        primary_member_id: primary.id.to_s }.merge(unpaid ? { payment_accepted: false } : {}),
       slack_channel:  ::Service::SlackConnector.members_relations_channel
     )
 
@@ -72,9 +77,18 @@ class Admin::GroupsController < AdminController
   def add_member
     secondary = Member.find(params[:secondary_member_id])
     raise ::Mongoid::Errors::DocumentNotFound.new(Member, { id: params[:secondary_member_id] }) if secondary.nil?
-    raise ::Error::UnprocessableEntity.new("Member is already part of a household") if secondary.groupName.present?
+    raise ::Error::UnprocessableEntity.new("Member is already part of a household") if secondary.household_role.present?
 
-    @group.add_subordinate(secondary)
+    override = @group.add_subordinate(secondary, address_override_reason: params[:address_override_reason])
+    unpaid = !@group.payment_accepted?
+
+    details = "#{secondary.fullname} was added"
+    details += ". #{current_member.fullname} overrode the address check (household #{override[:household_address]}, " \
+               "member #{override[:member_address]}) with the reason: #{override[:reason]}" if override
+    details += ". The household payment had not been accepted yet and the admin continued" if unpaid
+    snapshot = { groupName: @group.groupName, secondary_member_id: secondary.id.to_s, secondary_name: secondary.fullname }
+    snapshot[:address_override] = override if override
+    snapshot[:payment_accepted] = false if unpaid
 
     ::Service::AuditLogger.log(
       log_type:       'member',
@@ -82,9 +96,11 @@ class Admin::GroupsController < AdminController
       resource_type:  'Group',
       resource_id:    @group.id,
       actor:          current_member,
-      subject:        secondary,
-      after_snapshot: { groupName: @group.groupName, secondary_member_id: secondary.id.to_s,
-                        secondary_name: secondary.fullname },
+      # The Slack sentence reads "on <subject>'s Group", so the subject is the household's
+      # primary (the Group's owner); the member who was added is named in the details.
+      subject:        @group.member,
+      message_details: details,
+      after_snapshot: snapshot,
       slack_channel:  ::Service::SlackConnector.members_relations_channel
     )
 
@@ -111,7 +127,8 @@ class Admin::GroupsController < AdminController
       resource_type:  'Group',
       resource_id:    @group.id,
       actor:          current_member,
-      subject:        secondary,
+      subject:        @group.member,
+      message_details: "#{secondary.fullname} was removed",
       after_snapshot: { groupName: @group.groupName, secondary_member_id: secondary.id.to_s,
                         secondary_name: secondary.fullname },
       slack_channel:  ::Service::SlackConnector.members_relations_channel
@@ -126,7 +143,7 @@ class Admin::GroupsController < AdminController
     before = @group.attributes.dup
 
     # Revert all secondary members
-    @group.active_members.where(:id.ne => @group.groupName).each do |m|
+    @group.secondary_members.each do |m|
       @group.remove_subordinate(m)
     end
 

@@ -4,6 +4,7 @@ describe VolunteerTask, type: :model do
   let(:admin)      { create(:member, :admin) }
   let(:member)     { create(:member, status: 'activeMember') }
   let(:inactive)   { create(:member, status: 'inactive') }
+  let(:pending)    { create(:member, status: 'pending') }
   let(:revoked)    { create(:member, status: 'revoked') }
   let(:non_member) { create(:member, status: 'nonMember') }
 
@@ -19,7 +20,7 @@ describe VolunteerTask, type: :model do
 
   before do
     allow(VolunteerTask).to receive(:max_credit_value).and_return(2.0)
-    allow(EarnedMembership).to receive_message_chain(:where, :exists?).and_return(false)
+    allow(EarnedMembership).to receive_message_chain(:active, :where, :exists?).and_return(false)
     allow(SlackUser).to receive(:find_by).and_return(nil)
     allow(Service::SlackConnector).to receive(:enque_message)
     allow(Service::SlackConnector).to receive(:send_slack_message)
@@ -100,6 +101,11 @@ describe VolunteerTask, type: :model do
 
     it 'raises Forbidden for inactive member' do
       expect { task.claim!(inactive) }.to raise_error(Error::Forbidden)
+    end
+
+    it 'raises Forbidden for a pending member' do
+      expect(task.eligible_for?(pending)).to be(false)
+      expect { task.claim!(pending) }.to raise_error(Error::Forbidden)
     end
 
     it 'raises Forbidden for revoked member' do
@@ -267,6 +273,24 @@ describe VolunteerTask, type: :model do
     it 'raises Forbidden if task is not pending' do
       task.update!(status: 'claimed')
       expect { task.complete!(admin) }.to raise_error(Error::Forbidden)
+    end
+
+    it 'keeps closure metadata retryable when the follow-up credit confirmation write fails' do
+      closed_time = Time.current
+      task.update!(completed_at: closed_time - 6.days, approval_notification: {
+        'ts' => '123.456', 'channel' => 'CREVIEW', 'destination_mode' => 'production',
+        'started_at' => closed_time - 6.days, 'subject' => 'Submitted cleanup', 'finalized' => true
+      })
+      allow(Service::VolunteerApprovalReminder).to receive(:record_outcome!).and_raise('Outcome storage unavailable')
+
+      expect { task.complete!(admin) }.to raise_error(RuntimeError, 'Outcome storage unavailable')
+
+      expect(task.reload.status).to eq('completed')
+      expect(task.approval_notification).to include('ts' => '123.456', 'channel' => 'CREVIEW', 'finalized' => false)
+      expect(task.approval_notification['closed_at']).to be_present
+      expect(task.approval_notification['outcome']).to include('Credit award not confirmed', 'correct the award manually')
+      expect(VolunteerCredit.where(task_id: task.id, status: 'approved')).to exist
+      expect(VolunteerEventReminderJob.new.send(:retry_notifications, VolunteerTask).where(id: task.id)).to exist
     end
   end
 

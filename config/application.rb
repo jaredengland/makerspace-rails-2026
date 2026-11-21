@@ -11,6 +11,10 @@ require "action_controller/railtie"
 require "action_mailer/railtie"
 require "sprockets/railtie"
 require "rails/test_unit/railtie"
+require_relative "../lib/app_domain_url"
+require_relative "../lib/shortcode_resolver"
+require_relative "../lib/service/test_database_uri"
+require_relative "../lib/eventbrite_webhook_privacy"
 
 require 'dotenv'
 if (ENV["RAILS_ENV"] == 'production')
@@ -33,6 +37,8 @@ Mongoid.load!("#{__dir__}/mongoid.yml")
 module MemberInterface
   class Application < Rails::Application
     config.load_defaults 5.0
+    config.middleware.insert_before Rails::Rack::Logger, EventbriteWebhookPrivacy
+    config.middleware.insert_before ActionDispatch::Callbacks, ShortcodeResolver
 
     config.autoload_paths << "#{Rails.root}/lib"
     config.eager_load_paths << "#{Rails.root}/lib"

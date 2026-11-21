@@ -22,29 +22,10 @@ require 'devise'
 require 'base64'
 require 'bcrypt'
 require 'securerandom'
-
-SAFE_DATABASE_CLEANER_MLAB_URI_SUBSTRINGS = [
-  "127.0.0.1",
-  "://mongo:2701",
-  "localhost",
-  "dev",
-  "test"
-].freeze
+require Rails.root.join('lib/service/database_safety')
 
 def ensure_safe_database_cleaner_mlab_uri!
-  mlab_uri = ENV["MLAB_URI"].to_s
-  return if mlab_uri.present? && SAFE_DATABASE_CLEANER_MLAB_URI_SUBSTRINGS.any? { |safe_value| mlab_uri.include?(safe_value) }
-
-  if mlab_uri.present?
-    message = "Refusing to run DatabaseCleaner: MLAB_URI must contain one of " \
-            "#{SAFE_DATABASE_CLEANER_MLAB_URI_SUBSTRINGS.join(', ')}."
-  else
-    message = "Refusing to run DatabaseCleaner: MLAB_URI is not set, set MLAB_URI to contain one of " \
-            "#{SAFE_DATABASE_CLEANER_MLAB_URI_SUBSTRINGS.join(', ')}."
-  end
-  Rails.logger.error(message)
-  warn(message)
-  raise message
+  Service::DatabaseSafety.ensure_safe_mlab_uri!(operation: 'DatabaseCleaner')
 end
 
 # Add additional requires below this line. Rails is not loaded until this point!
@@ -77,11 +58,16 @@ RSpec.configure do |config|
   config.before(:suite) do
     ensure_safe_database_cleaner_mlab_uri!
     DatabaseCleaner[:mongoid].clean_with(:deletion)
+    AvailableShopCache.invalidate
+    EventbriteIntegration::DisplayCache.invalidate_all
   end
   config.before(:each) do |example|
     ensure_safe_database_cleaner_mlab_uri!
     DatabaseCleaner[:mongoid].strategy = :deletion
     DatabaseCleaner[:mongoid].start
+    # DatabaseCleaner bypasses Shop callbacks. Clear only this database's display cache.
+    AvailableShopCache.invalidate
+    EventbriteIntegration::DisplayCache.invalidate_all
   end
   config.after(:each) do
     ensure_safe_database_cleaner_mlab_uri!

@@ -33,7 +33,7 @@ module Service
     #   log_type:        (required) "member" | "portal"
     #   event_type:      (required) e.g. "member_updated", "membership_revoked"
     #   resource_type:   (required) Mongoid model class name, e.g. "Member"
-    #   resource_id:     (required) BSON::ObjectId of the record changed
+    #   resource_id:     (required) record ObjectId, or integer for a FixTicket
     #
     #   actor:           (optional) Member instance — who made the change.
     #                    Falls back to Current.actor if not passed.
@@ -47,6 +47,8 @@ module Service
     #   before_snapshot: (optional) Hash — full document before the change.
     #   after_snapshot:  (optional) Hash — full document after the change.
     #
+    #   message_details: (optional) Human-readable context appended to the
+    #                    generated Slack message.
     #   slack_channel:   (optional) Channel to post to. Omit to skip Slack entirely.
     #
     # Returns the persisted AuditLog document, or nil if the write failed
@@ -62,6 +64,7 @@ module Service
       field_changes: nil,
       before_snapshot: nil,
       after_snapshot: nil,
+      message_details: nil,
       slack_channel: nil
     )
       validate_required!(log_type: log_type, event_type: event_type,
@@ -87,7 +90,8 @@ module Service
         actor_name:    actor_name,
         subject_name:  subject_name,
         resource_type: resource_type,
-        field_changes: clean_field_changes
+        field_changes: clean_field_changes,
+        message_details: message_details
       )
 
       # Attempt Slack post if a channel was provided
@@ -102,7 +106,7 @@ module Service
         subject_id:      subject_id,
         subject_name:    subject_name,
         resource_type:   resource_type,
-        resource_id:     to_object_id(resource_id),
+        resource_id:     resource_type == 'FixTicket' ? FixTicketId.mongoize(resource_id) : to_object_id(resource_id),
         field_changes:   clean_field_changes,
         before_snapshot: clean_before,
         after_snapshot:  clean_after,
@@ -169,7 +173,14 @@ module Service
 
     # Generates a human-readable Slack message from structured data.
     # Always produced; only posted when slack_channel is present.
-    def self.generate_message(event_type:, actor_name:, subject_name:, resource_type:, field_changes:)
+    def self.generate_message(
+      event_type:,
+      actor_name:,
+      subject_name:,
+      resource_type:,
+      field_changes:,
+      message_details:
+    )
       parts = []
 
       # Lead with event label
@@ -191,6 +202,7 @@ module Service
         parts << "— #{diff}" if diff.present?
       end
 
+      parts << "— #{message_details}" if message_details.present?
       parts.join(' ')
     end
 
@@ -214,7 +226,9 @@ module Service
       return nil if channel.blank?
 
       begin
-        ::Service::SlackConnector.send_slack_message(message, channel)
+        # This entry already records the post in slack_posted, so the Slack
+        # message log skips it.
+        ::Service::SlackMessageLog.without_logging { ::Service::SlackConnector.send_slack_message(message, channel) }
         true
       rescue => e
         notify_honeybadger(e, context: { slack_channel: channel, slack_message: message })
@@ -230,13 +244,9 @@ module Service
       nil
     end
 
-    # Notifies Honeybadger if available; logs to Rails.logger as fallback.
+    # Logs every error locally before additionally notifying Honeybadger when available.
     def self.notify_honeybadger(error, context: {})
-      if defined?(Honeybadger)
-        Honeybadger.notify(error, context: context)
-      else
-        Rails.logger.error("[AuditLogger] #{error.class}: #{error.message} | context: #{context.inspect}")
-      end
+      Service::ErrorReporter.notify(error, context: context)
     end
   end
 end

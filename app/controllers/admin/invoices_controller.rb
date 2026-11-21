@@ -26,11 +26,13 @@ class Admin::InvoicesController < AdminOrRmController
         query = query_to_bool(invoice_query_params[:settled],
           {"$or" => [
             { :settled_at.ne => nil },
-            { :transaction_id.ne => nil }
+            { :transaction_id.ne => nil },
+            { :membership_paid_confirmed_at.ne => nil }
           ]},
           {"$and" => [
             { settled_at: nil },
-            { transaction_id: nil }
+            { transaction_id: nil },
+            { membership_paid_confirmed_at: nil }
           ]},
         )
       elsif key === :past_due
@@ -38,13 +40,13 @@ class Admin::InvoicesController < AdminOrRmController
           {"$or" => [
             { settled_at: nil },
             { transaction_id: nil }
-          ], :due_date.lt => Time.now },
+          ], :due_date.lt => Time.now, membership_paid_confirmed_at: nil },
           {"$or" => [
             {"$and" => [
               { :settled_at.ne => nil },
               { :transaction_id.ne => nil }
             ]},
-            :due_date.gte => Time.now] }
+            { :membership_paid_confirmed_at.ne => nil }, :due_date.gte => Time.now] }
         )
       elsif bool_params.include?(key)
         query = query_bool_by_name(invoice_query_params[key], key)
@@ -85,7 +87,8 @@ class Admin::InvoicesController < AdminOrRmController
       log_type: 'member', event_type: 'invoice_created', resource_type: 'Invoice',
       resource_id: invoice.id, actor: current_member, subject: invoice.member,
       field_changes: invoice.previous_changes, before_snapshot: {},
-      after_snapshot: invoice.attributes, slack_channel: ::Service::SlackConnector.logs_channel
+      after_snapshot: invoice.attributes, message_details: billing_audit_details(invoice),
+      slack_channel: ::Service::SlackConnector.logs_channel
     )
 
     render json: invoice, adapter: :attributes and return
@@ -103,7 +106,8 @@ class Admin::InvoicesController < AdminOrRmController
       log_type: 'member', event_type: 'invoice_updated', resource_type: 'Invoice',
       resource_id: @invoice.id, actor: current_member, subject: @invoice.member,
       field_changes: @invoice.previous_changes, before_snapshot: before,
-      after_snapshot: @invoice.reload.attributes, slack_channel: ::Service::SlackConnector.logs_channel
+      after_snapshot: @invoice.reload.attributes, message_details: billing_audit_details(@invoice),
+      slack_channel: ::Service::SlackConnector.logs_channel
     )
 
     render json: @invoice, adapter: :attributes and return
@@ -118,7 +122,8 @@ class Admin::InvoicesController < AdminOrRmController
       log_type: 'member', event_type: 'invoice_deleted', resource_type: 'Invoice',
       resource_id: before['_id'], actor: current_member, subject: member,
       field_changes: {}, before_snapshot: before,
-      after_snapshot: {}, slack_channel: ::Service::SlackConnector.logs_channel
+      after_snapshot: {}, message_details: billing_audit_details(before),
+      slack_channel: ::Service::SlackConnector.logs_channel
     )
 
     render json: {}, status: 204 and return
@@ -147,16 +152,23 @@ class Admin::InvoicesController < AdminOrRmController
       log_type: 'member', event_type: 'invoice_force_cancelled', resource_type: 'Invoice',
       resource_id: before['_id'], actor: current_member, subject: member,
       field_changes: {}, before_snapshot: before,
-      after_snapshot: {}, slack_channel: ::Service::SlackConnector.logs_channel
+      after_snapshot: {}, message_details: billing_audit_details(before),
+      slack_channel: ::Service::SlackConnector.logs_channel
     )
 
     render json: {}, status: 204 and return
   rescue => e
-    Honeybadger.notify(e) if defined?(Honeybadger)
+    Service::ErrorReporter.notify(e)
     render json: { error: e.message }, status: :unprocessable_content and return
   end
 
   private
+
+  def billing_audit_details(invoice)
+    id = invoice.respond_to?(:id) ? invoice.id : invoice["_id"]
+    resource_class = invoice.respond_to?(:resource_class) ? invoice.resource_class : invoice["resource_class"]
+    ["Braintree invoice ID: #{id}", ("resource class: #{resource_class}" if resource_class.present?)].compact.join(", ")
+  end
 
   # Admins/board can manage any invoice type and action.
   # Resource Managers can only create/view/update/delete fee invoices

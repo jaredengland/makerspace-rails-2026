@@ -3,30 +3,51 @@ class Admin::SystemConfigsController < AdminController
   # Keys that can be toggled as boolean flags
   FLAG_KEYS = [
     SystemConfig::SLACK_SYNC_ENABLED,
+    SystemConfig::SLACK_PROFILE_SYNC_ENABLED,
     'volunteer_bounty_token_enabled',
     'require_totp_admin',
     'require_totp_board',
     'require_totp_rm',
+    SystemConfig::SIGNUP_LOCKOUT_ENABLED,
+    SystemConfig::FOB_REMINDER_ENABLED,
+    SystemConfig::SIGNUP_REMINDER_ENABLED,
   ].freeze
 
   # Keys that can be updated as plain string values
   SETTING_KEYS = [
+    'checkout_expiration_notice_days',
+    'ticket_open_limit',
     # Slack channels
     'slack_channel_treasurer',
     'slack_channel_rm',
     'slack_channel_admin',
     'slack_channel_logs',
+    'slack_channel_tickets',
+    'slack_channel_new_members',
+    'slack_channel_upcoming_events',
     'volunteer_pending_slack_channel',
     # Volunteer settings
     'volunteer_credits_per_discount',
     'volunteer_max_discounts_per_year',
     'volunteer_discount_id',
     'volunteer_task_max_credit',
+    'ticket_bounty_max_credit',
     'volunteer_bounty_token',
     'volunteer_rolling_days',
     'volunteer_leaderboard_top',
+    # Reservation settings
+    'reservation_token',
     # Security settings
     'devise_timeout_minutes',
+    # Job schedule
+    SystemConfig::CHANNEL_CACHE_REFRESH_DAY,
+    SystemConfig::CARD_EXPIRATION_CHECK_DAY,
+    SystemConfig::GARBAGE_COLLECT_DAY,
+    # Member reminder emails
+    SystemConfig::FOB_REMINDER_DAYS,
+    SystemConfig::SIGNUP_REMINDER_DAYS,
+    # Slack Identity Conflicts page scan size (edited from that page)
+    SystemConfig::SLACK_CONFLICT_SCAN_SIZE,
   ].freeze
 
   ALL_EDITABLE_KEYS = (FLAG_KEYS + SETTING_KEYS).freeze
@@ -35,10 +56,14 @@ class Admin::SystemConfigsController < AdminController
   def index
     flags = {
       slack_sync_enabled:             SystemConfig.enabled?(SystemConfig::SLACK_SYNC_ENABLED),
+      slack_profile_sync_enabled:     SystemConfig.enabled?(SystemConfig::SLACK_PROFILE_SYNC_ENABLED),
       volunteer_bounty_token_enabled: SystemConfig.enabled?('volunteer_bounty_token_enabled'),
       require_totp_admin:             SystemConfig.enabled?('require_totp_admin'),
       require_totp_board:             SystemConfig.enabled?('require_totp_board'),
       require_totp_rm:                SystemConfig.enabled?('require_totp_rm'),
+      signup_lockout_enabled:         SystemConfig.enabled?(SystemConfig::SIGNUP_LOCKOUT_ENABLED),
+      fob_reminder_enabled:           SystemConfig.enabled?(SystemConfig::FOB_REMINDER_ENABLED),
+      signup_reminder_enabled:        SystemConfig.enabled?(SystemConfig::SIGNUP_REMINDER_ENABLED),
     }
 
     jobs = SystemConfig::JOB_KEYS.map do |job_key, task_name|
@@ -52,11 +77,15 @@ class Admin::SystemConfigsController < AdminController
     end
 
     slack = {
+      slack_channel_upcoming_events: SystemConfig.get('slack_channel_upcoming_events').presence || 'upcoming-events',
       slack_channel_treasurer:          SystemConfig.get('slack_channel_treasurer')          || 'treasurer',
-      slack_channel_rm:                 SystemConfig.get('slack_channel_rm')                 || 'members_relations',
-      slack_channel_admin:              SystemConfig.get('slack_channel_admin')               || 'general',
+      slack_channel_rm:                 Service::SlackConnector.resource_managers_channel,
+      slack_channel_admin:              Service::SlackConnector.members_relations_channel,
+      slack_channel_tickets: SystemConfig.slack_tickets_channel,
       slack_channel_logs:               SystemConfig.get('slack_channel_logs')               || 'interface-logs',
+      slack_channel_new_members:        SystemConfig.get('slack_channel_new_members')        || 'new_members',
       volunteer_pending_slack_channel:  SystemConfig.get('volunteer_pending_slack_channel')  || 'general',
+      channel_cache:                     Service::SlackChannelCache.status,
     }
 
     volunteer = {
@@ -64,6 +93,7 @@ class Admin::SystemConfigsController < AdminController
       volunteer_max_discounts_per_year: SystemConfig.get('volunteer_max_discounts_per_year') || '2',
       volunteer_discount_id:            SystemConfig.get('volunteer_discount_id')             || '',
       volunteer_task_max_credit:        SystemConfig.get('volunteer_task_max_credit')         || '2.0',
+      ticket_bounty_max_credit:         SystemConfig.get('ticket_bounty_max_credit')          || '2.0',
       volunteer_bounty_token:           SystemConfig.get('volunteer_bounty_token')            || '',
       volunteer_rolling_days:           SystemConfig.get('volunteer_rolling_days')           || '90',
       volunteer_leaderboard_top:        SystemConfig.get('volunteer_leaderboard_top')        || '10',
@@ -76,16 +106,36 @@ class Admin::SystemConfigsController < AdminController
     }
 
     security = {
+      ticket_open_limit: FixTicketService.limit,
       devise_timeout_minutes: SystemConfig.get('devise_timeout_minutes') || '30',
     }
 
+    reservation = {
+      reservation_token: SystemConfig.get('reservation_token') || '',
+    }
+
+    job_schedule = {
+      channel_cache_refresh_day: SystemConfig.get(SystemConfig::CHANNEL_CACHE_REFRESH_DAY) || '1',
+      card_expiration_check_day:       SystemConfig.get(SystemConfig::CARD_EXPIRATION_CHECK_DAY)       || '1',
+      garbage_collect_day:             SystemConfig.get(SystemConfig::GARBAGE_COLLECT_DAY)             || '1',
+    }
+
+    reminders = {
+      fob_reminder_days:    SystemConfig.reminder_days(SystemConfig::FOB_REMINDER_DAYS).to_s,
+      signup_reminder_days: SystemConfig.reminder_days(SystemConfig::SIGNUP_REMINDER_DAYS).to_s,
+    }
+
     render json: {
+      checkout: { checkout_expiration_notice_days: CheckoutExpirationNotice.advance_days, can_manage: is_admin? },
       flags:     flags,
       jobs:      jobs,
       slack:     slack,
       volunteer: volunteer,
       totp:      totp,
       security:  security,
+      reservation: reservation,
+      job_schedule: job_schedule,
+      reminders: reminders,
     }, status: :ok
   end
 
@@ -127,6 +177,14 @@ class Admin::SystemConfigsController < AdminController
       render json: { error: "Unknown setting key: #{key}" }, status: :unprocessable_content and return
     end
 
+    if slack_channel_setting?(key)
+      value = Service::SlackChannelCache.normalize_name(value)
+      Service::SlackChannelCache.lookup(
+        value,
+        refresh_on_miss: !Rails.env.test?
+      ) if value.present?
+    end
+
     old_value = SystemConfig.get(key).to_s
     return unless valid_setting_value?(key, value)
 
@@ -136,6 +194,9 @@ class Admin::SystemConfigsController < AdminController
     else
       SystemConfig.set(key, value)
     end
+
+    # A scan in progress was started with the old piece size; start the next one with the new size.
+    Service::SlackUserSync.clear_live_conflicts_cache if key == SystemConfig::SLACK_CONFLICT_SCAN_SIZE
 
     # Audit log goes to logs channel for all setting changes.
     # volunteer_discount_id also posts to treasurer via notify_volunteer_discount_changed above —
@@ -161,18 +222,46 @@ class Admin::SystemConfigsController < AdminController
       render json: { error: "Unknown job: #{job_key}" }, status: :unprocessable_content and return
     end
 
+    raise Error::Forbidden.new('Only admins may run checkout expiration notices') if job_key == 'checkout_expiration_notice' && !is_admin?
     case job_key
+    when 'checkout_expiration_notice' then CheckoutExpirationNoticeJob.perform_later
     when 'slack_sync'      then SlackSyncJob.perform_later
+    when 'slack_profile_sync' then SlackProfileSyncJob.perform_later
+    when 'slack_channel_cache' then SlackChannelCacheRefreshJob.perform_later
     when 'member_review'   then MemberReviewJob.perform_later
     when 'invoice_review'  then InvoiceReviewJob.perform_later
     when 'garbage_collect' then GarbageCollectJob.perform_later
     when 'db_backup'       then DatabaseBackupJob.perform_later
+    when 'card_expiration_check' then CardExpirationCheckJob.perform_later
+    when 'reservation_canvas_rebuild'
+      ReservationSlackCanvasRebuildJob.perform_later
+    when 'reservation_slack_announcements'
+      ReservationSlackAnnouncementJob.perform_later
+    when 'member_provisioning_reconciliation'
+      MemberProvisioningReconciliationJob.perform_later
+    when 'volunteer_event_reminder'
+      VolunteerEventReminderJob.perform_later
+    when 'membership_expiration_notice'
+      MembershipExpirationNoticeJob.perform_later
+    when 'member_reminders'
+      MemberReminderJob.perform_later
+    when 'checkout_request_reminder'
+      CheckoutRequestReminderJob.perform_later
+    when 'checkout_request_digest'
+      CheckoutRequestDigestJob.perform_later
+    when 'rental_vacating_check'
+      RentalVacatingCheckJob.perform_later
     end
 
     render json: { message: "#{job_key} enqueued successfully" }, status: :ok
   end
 
   private
+
+  def slack_channel_setting?(key)
+    key.start_with?("slack_channel_") ||
+      key == "volunteer_pending_slack_channel"
+  end
 
   # Posts to logs and treasurer channels when the volunteer discount setting changes.
   # Fetches discount descriptions from Braintree for a human-readable audit trail.
@@ -191,10 +280,42 @@ class Admin::SystemConfigsController < AdminController
     ::Service::SlackConnector.send_slack_message(message, ::Service::SlackConnector.logs_channel)
     ::Service::SlackConnector.send_slack_message(message, ::Service::SlackConnector.treasurer_channel)
   rescue => e
-    Honeybadger.notify(e) if defined?(Honeybadger)
+    Service::ErrorReporter.notify(e)
   end
 
   def valid_setting_value?(key, value)
+    if key == 'checkout_expiration_notice_days'
+      raise Error::Forbidden.new('Only admins may change checkout expiration notices') unless is_admin?
+      return true if value.match?(/\A\d+\z/) && value.to_i >= 4
+      render json: { error: 'Advance notice must be a whole number of at least 4 days' }, status: :unprocessable_entity
+      return false
+    end
+    if key == 'ticket_bounty_max_credit'
+      amount = Float(value, exception: false)
+      return true if amount && amount.finite? && amount >= 0.5
+      render json: { error: 'Ticket bounty maximum must be a finite number of at least 0.5 credits' }, status: :unprocessable_entity
+      return false
+    end
+    if key == 'ticket_open_limit'
+      raise Error::Forbidden.new unless current_member.role == 'admin'
+      return true if value.match?(/\A[1-9]\d*\z/)
+      render json: { error: 'ticket_open_limit must be a positive integer' }, status: :unprocessable_entity
+      return false
+    end
+    if key == SystemConfig::SLACK_CONFLICT_SCAN_SIZE
+      min = SystemConfig::SLACK_CONFLICT_SCAN_SIZE_MIN
+      max = SystemConfig::SLACK_CONFLICT_SCAN_SIZE_MAX
+      return true if value.match?(/\A\d+\z/) && value.to_i.between?(min, max)
+      render json: { error: "Slack accounts per scan step must be a whole number from #{min} to #{max}" },
+             status: :unprocessable_entity
+      return false
+    end
+    if [SystemConfig::FOB_REMINDER_DAYS, SystemConfig::SIGNUP_REMINDER_DAYS].include?(key)
+      return true if value.match?(/\A\d+\z/) && value.to_i.between?(1, SystemConfig::REMINDER_DAYS_MAX)
+      render json: { error: "Reminder days must be a whole number from 1 to #{SystemConfig::REMINDER_DAYS_MAX}" },
+             status: :unprocessable_entity
+      return false
+    end
     return true unless key == 'devise_timeout_minutes'
 
     timeout_minutes = Integer(value)

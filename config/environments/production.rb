@@ -1,8 +1,12 @@
 Rails.application.configure do
 
   # Settings specified here will take precedence over those in config/application.rb.
+  config.x.app_base_url = AppDomainUrl.base_url(
+    ENV.fetch("APP_DOMAIN"),
+    environment: Rails.env
+  )
   config.action_mailer.default_url_options = {
-    host: ENV.fetch('APP_DOMAIN'),
+    host: AppDomainUrl.host(ENV.fetch("APP_DOMAIN")),
     protocol: "https"
   }
   config.action_mailer.delivery_method = :smtp
@@ -13,7 +17,8 @@ Rails.application.configure do
   config.cache_store = :redis_cache_store, {
     url: ENV["REDIS_URL"],
     expires_in: 1.hour,
-    namespace: "cache"
+    namespace: "cache",
+    ssl_params: { verify_mode: OpenSSL::SSL::VERIFY_NONE }
   }
 
   if ENV['GMAIL_USERNAME'].present?
@@ -21,7 +26,7 @@ Rails.application.configure do
       authentication: :plain,
       address: 'smtp.gmail.com',
       port: 587,
-      domain: 'makerspace-interface.herokuapp.com',
+      domain: 'makerspace-interface-prod-c06ed374f965.herokuapp.com',
       user_name: ENV['GMAIL_USERNAME'],
       password: ENV['GMAIL_PASSWORD']
     }
@@ -44,7 +49,7 @@ Rails.application.configure do
   config.cache_classes = true
   config.hosts << "members.manchestermakerspace.com"
   config.hosts << "members.manchestermakerspace.org"
-  config.hosts << "makerspace-dev-51ba804d4c30.herokuapp.com"
+  config.hosts << "makerspace-interface-prod-c06ed374f965.herokuapp.com"
   # Eager load code on boot. This eager loads most of Rails and
   # your application in memory, allowing both threaded web servers
   # and those relying on copy on write to perform better.
@@ -75,7 +80,7 @@ Rails.application.configure do
 
   # Enable serving of images, stylesheets, and JavaScripts from an asset server.
   # config.action_controller.asset_host = config.action_mailer.default_url_options[:host]
-  config.action_mailer.asset_host = config.action_mailer.default_url_options[:host]
+  config.action_mailer.asset_host = config.x.app_base_url
   
   # Specifies the header that your server uses for sending files.
   # config.action_dispatch.x_sendfile_header = 'X-Sendfile' # for Apache

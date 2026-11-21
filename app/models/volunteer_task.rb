@@ -1,4 +1,5 @@
 class VolunteerTask
+  prepend FixTicketBounty
   include Mongoid::Document
   include SanitizesUserInput
   include Mongoid::Timestamps
@@ -14,6 +15,8 @@ class VolunteerTask
 
   # Optional shop association
   field :shop_id,      type: BSON::ObjectId, default: nil
+  field :ticket_id, type: FixTicketId
+  field :prerequisite_tool_ids, type: Array, default: []
 
   # Lifecycle status
   # available  — posted, open for claiming
@@ -31,6 +34,9 @@ class VolunteerTask
   # Recurrence interval in days (recurring tasks only)
   field :days,           type: Integer, default: nil
 
+  # Optional Eastern weekday for new claims on multi-use parent tasks (0 = Sunday).
+  field :day_of_week,    type: Integer, default: nil
+
   # Date after which a recurring task is claimable again (set on the parent)
   field :next_available, type: Date,    default: nil
 
@@ -43,6 +49,9 @@ class VolunteerTask
   field :completed_at,     type: Time,            default: nil
   field :verified_by_id,   type: BSON::ObjectId,  default: nil
   field :rejection_reason, type: String,           default: nil
+  field :approval_notification, type: Hash, default: {}
+  field :approval_notification_history, type: Array, default: []
+  field :approver_notifications, type: Hash, default: {}
 
   SINGLE_USE_STATUSES = %w[available claimed pending completed cancelled denied].freeze
   MULTI_USE_STATUSES  = %w[reusable repeatable recurring].freeze
@@ -51,17 +60,28 @@ class VolunteerTask
   validates :title,        presence: true
   validates :description,  presence: true
   validates :credit_value, numericality: { greater_than: 0 }
+  validate do
+    errors.add(:credit_value, 'must be finite') if credit_value && !credit_value.finite?
+  end
   validates_inclusion_of :status, in: VALID_STATUSES
   validates :days, numericality: { only_integer: true, greater_than: 0 }, allow_nil: true
+  validates :day_of_week, inclusion: { in: 0..6 }, allow_nil: true
+  validate do
+    errors.add(:day_of_week, 'must be a whole number from 0 (Sunday) to 6 (Saturday)') if @invalid_day_of_week
+  end
 
   validate :days_required_for_recurring
   validate :credit_value_within_max, on: :create
+  validate :prerequisites_belong_to_shop
 
   before_create :assign_task_number
+  before_destroy :retire_approval_reminders_before_destruction
 
   index({ status: 1 })
+  index({ status: 1, completed_at: 1 })
   index({ claimed_by_id: 1 })
   index({ parent_task_id: 1 })
+  index({ shop_id: 1 })
   index({ task_number: 1 }, { unique: true })
 
   # ── Scopes ────────────────────────────────────────────────────────────────
@@ -69,13 +89,19 @@ class VolunteerTask
   scope :available, -> { where(status: 'available') }
   scope :active,    -> { where(:status.in => %w[available claimed pending reusable repeatable recurring]) }
 
-  # Claimable from the member's perspective — excludes recurring tasks still cooling down
+  # Weekday filtering affects new claims on multi-use parents only. Existing
+  # child claims keep their lifecycle regardless of the parent's current day.
   scope :claimable, -> {
     any_of(
       { :status.in => %w[available reusable repeatable] },
       { status: 'recurring', :next_available.lte => Date.today },
       { status: 'recurring', next_available: nil }
-    )
+    ).and('$or' => [
+      { :status.nin => MULTI_USE_STATUSES },
+      { :parent_task_id.ne => nil },
+      { day_of_week: nil },
+      { day_of_week: business_date.wday }
+    ])
   }
 
   # ── Settings ──────────────────────────────────────────────────────────────
@@ -85,8 +111,26 @@ class VolunteerTask
       ENV.fetch('VOLUNTEER_TASK_MAX_CREDIT', 2.0)).to_f
   end
 
+  def self.ticket_bounty_max_credit
+    (SystemConfig.get('ticket_bounty_max_credit') || '2.0').to_f
+  end
+
   def self.find_by_number(number)
     find_by(task_number: number.to_i)
+  end
+
+  def self.business_date(time: Time.current)
+    time.in_time_zone('America/New_York').to_date
+  end
+
+  def day_of_week=(value)
+    candidate = value.is_a?(String) ? value.strip : value
+    blank = candidate.nil? || candidate == ''
+    valid = blank || (candidate.is_a?(Integer) && (0..6).cover?(candidate)) ||
+      (candidate.is_a?(String) && candidate.match?(/\A[0-6]\z/))
+    # Validate before Mongoid's Integer coercion can silently truncate fractions.
+    @invalid_day_of_week = !valid
+    write_attribute(:day_of_week, valid && !blank ? candidate : nil)
   end
 
   # ── Derived Flags ─────────────────────────────────────────────────────────
@@ -99,12 +143,12 @@ class VolunteerTask
     VolunteerTask.find(parent_task_id) if parent_task_id
   end
 
-  def multi_use?
-    MULTI_USE_STATUSES.include?(status)
-  end
-
   def currently_cooling_down?
     status == 'recurring' && next_available.present? && next_available > Date.today
+  end
+
+  def weekday_available?(date: self.class.business_date)
+    child_task? || !MULTI_USE_STATUSES.include?(status) || day_of_week.nil? || day_of_week == date.wday
   end
 
   # ── Instance Methods ──────────────────────────────────────────────────────
@@ -115,6 +159,41 @@ class VolunteerTask
 
   def shop
     Shop.find(shop_id) if shop_id
+  end
+
+  def prerequisite_tools
+    ids = Array(prerequisite_tool_ids).map(&:to_s).uniq
+    ids.present? ? Tool.where(:id.in => ids) : Tool.none
+  end
+
+  def missing_prerequisite_tools(member)
+    Tool.where(:id.in => missing_prerequisite_tool_ids(member)).to_a
+  end
+
+  def missing_prerequisite_tool_ids(member)
+    required_ids = Array(prerequisite_tool_ids).map(&:to_s).uniq
+    return [] if required_ids.empty?
+
+    checked_out_ids = ToolCheckout.valid_at.where(
+      member_id: member.id,
+      revoked_at: nil,
+      :tool_id.in => required_ids
+    ).pluck(:tool_id).map(&:to_s)
+    required_ids - checked_out_ids
+  end
+
+  def missing_prerequisite_tool_names(member)
+    tools_by_id = VolunteerTaskVisibility.new(self, member).prerequisite_tools.index_by { |tool| tool.id.to_s }
+    missing_prerequisite_tool_ids(member).map do |tool_id|
+      tools_by_id[tool_id]&.name || "Unavailable tool"
+    end
+  end
+
+  def eligible_for?(member)
+    return false unless member&.status == "activeMember"
+    return true if %w[admin board_member resource_manager].include?(member.role)
+
+    missing_prerequisite_tool_ids(member).empty?
   end
 
   def created_by
@@ -134,12 +213,18 @@ class VolunteerTask
   # Reusable:   creates a child task; member may not have an existing child for this parent.
   # Repeatable: creates a child task; same member may claim multiple times.
   # Recurring:  creates a child task; respects next_available cooldown; sets parent claimed_at + status + next_available.
-  def claim!(member)
-    raise Error::Forbidden.new unless member.status == 'activeMember'
+  def claim!(member, sync_canvas: true)
+    reload
+    raise Error::Forbidden.new unless member.status == "activeMember"
+    raise Error::Forbidden.new unless weekday_available?
+    raise Error::Forbidden.new unless eligible_for?(member)
 
-    case status
+    result = case status
     when 'available'
+      previous_notification = approval_notification.deep_dup
       update!(status: 'claimed', claimed_by_id: member.id, claimed_at: Time.now)
+      Service::VolunteerApprovalReminder.reset!(self, previous_notification: previous_notification)
+      self
 
     when 'reusable'
       already_claimed = VolunteerTask.where(
@@ -169,35 +254,73 @@ class VolunteerTask
     else
       raise Error::Forbidden.new
     end
+
+    enqueue_volunteer_canvas_sync(struck_task_id: child_task? ? parent_task_id : id) if sync_canvas
+    result
   end
 
   def mark_pending!(member)
+    reload
     raise Error::Forbidden.new unless status == 'claimed' && claimed_by_id == member.id
+    previous_notification = approval_notification.deep_dup
     update!(status: 'pending', completed_at: Time.now)
+    Service::VolunteerApprovalReminder.reset!(self, previous_notification: previous_notification)
+    VolunteerApproverNotification.notify!(self)
   end
 
   def complete!(verifier)
+    reload
     raise Error::Forbidden.new if verifier.id == claimed_by_id
     raise Error::Forbidden.new unless status == 'pending'
 
-    update!(status: 'completed', verified_by_id: verifier.id)
-
-    credit = VolunteerCredit.create!(
-      member_id:    claimed_by_id,
-      issued_by_id: verifier.id,
-      task_id:      id,
-      description:  "Completed bounty task: #{effective_title}",
-      credit_value: credit_value,
-      status:       'approved'
+    notification = Service::VolunteerApprovalReminder.outcome_attributes(
+      self, outcome: "Approved by #{verifier.fullname}"
+    ).fetch(:approval_notification, {})
+    provisional_notification = notification.empty? ? {} : notification.merge(
+      'outcome' => "Credit award not confirmed during approval by #{verifier.fullname}; " \
+        'verify whether a credit was saved and correct the award manually'
     )
-    credit.send(:notify_member_credit_awarded)
-    credit.send(:check_discount_threshold!)
+    Service::VolunteerApprovalReminder.transition_with_outcome!(
+      self, { status: 'completed', verified_by_id: verifier.id }, notification: provisional_notification
+    )
 
-    notify_task_verified(verifier)
+    approval_error = nil
+    credit_created = false
+    begin
+      credit = VolunteerCredit.create!(
+        member_id:    claimed_by_id,
+        issued_by_id: verifier.id,
+        task_id:      id,
+        description:  "Completed bounty task: #{effective_title}",
+        credit_value: credit_value,
+        status:       'approved'
+      )
+      credit_created = true
+      credit.send(:notify_member_credit_awarded)
+      credit.send(:check_discount_threshold!)
+
+      notify_task_verified(verifier)
+    rescue => error
+      approval_error = error
+      raise
+    ensure
+      begin
+        if !credit_created && notification.present?
+          notification['outcome'] = "Credit award failed during approval by #{verifier.fullname}; " \
+            'verify whether a credit was saved and correct the award manually'
+        end
+        Service::VolunteerApprovalReminder.record_outcome!(self, notification, expected_status: 'completed')
+        Service::VolunteerApprovalReminder.sync_closed!(self)
+      rescue
+        # The service reports metadata failures. Preserve a simultaneous award
+        # failure rather than replacing the existing domain error.
+        raise unless approval_error
+      end
+    end
   end
 
   # Release a claimed task back to available (or deny a child task).
-  def release!(admin, reason)
+  def release!(admin, reason, notify: true)
     raise Error::Forbidden.new unless status == 'claimed'
     raise Error::Forbidden.new if admin.id == claimed_by_id
 
@@ -214,36 +337,96 @@ class VolunteerTask
       )
     end
 
-    notify_member_task_released(former_claimant_id, reason)
+    if notify
+      notify_member_task_released(former_claimant_id, reason)
+      enqueue_volunteer_canvas_sync
+    end
   end
 
   # Reject a pending task (or deny a child task).
-  def reject_pending!(admin, reason)
+  def reject_pending!(admin, reason, notify: true)
+    reload
     raise Error::Forbidden.new unless status == 'pending'
     raise Error::Forbidden.new if admin.id == claimed_by_id
 
     former_claimant_id = claimed_by_id
+    notification = Service::VolunteerApprovalReminder.outcome_attributes(
+      self, outcome: "Denied by #{admin.fullname}. Reason: #{reason}"
+    ).fetch(:approval_notification, {})
 
     if child_task?
-      update!(status: 'denied', rejection_reason: reason)
+      Service::VolunteerApprovalReminder.transition_with_outcome!(
+        self, { status: 'denied', rejection_reason: reason }, notification: notification
+      )
     else
-      update!(
+      Service::VolunteerApprovalReminder.transition_with_outcome!(self, {
         status:           'available',
         claimed_by_id:    nil,
         claimed_at:       nil,
         completed_at:     nil,
         rejection_reason: reason
-      )
+      }, notification: notification)
     end
 
-    notify_member_task_rejected(former_claimant_id, reason)
+    if notify
+      notify_member_task_rejected(former_claimant_id, reason)
+      enqueue_volunteer_canvas_sync
+      Service::VolunteerApprovalReminder.sync_closed!(self)
+    end
   end
 
   def cancel!
-    update!(status: 'cancelled')
+    reload
+    notification = pending_review_outcome_for_status('cancelled')
+    Service::VolunteerApprovalReminder.transition_with_outcome!(
+      self, { status: 'cancelled' }, notification: notification
+    )
+    close_pending_review_notification!(notification)
+  end
+
+  def update_with_review_outcome!(attributes, actor: nil)
+    notification = pending_review_outcome_for_status(attributes[:status] || attributes['status'], actor: actor)
+    Service::VolunteerApprovalReminder.transition_with_outcome!(self, attributes, notification: notification)
+    notification
+  end
+
+  # Generic status edits do not issue credits or run the verification flow.
+  # Close an outstanding reminder with that actual outcome, including receipts
+  # whose pending-message delivery was already marked finalized.
+  def pending_review_outcome_for_status(new_status, actor: nil)
+    return {} if new_status.blank? || new_status == status
+
+    receipt = approval_notification.to_h
+    open_receipt = receipt['closed_at'].blank? && (receipt['started_at'].present? || receipt['ts'].present?)
+    return {} unless status == 'pending' || open_receipt
+
+    actor_description = actor ? " by #{actor.fullname}" : ''
+    outcome = case new_status
+    when 'cancelled'
+      "Task cancelled#{actor_description}"
+    when 'completed'
+      "Task marked completed#{actor_description} through a status edit; no credits were issued by this edit"
+    when 'denied'
+      "Denied#{actor_description} through a task status edit"
+    else
+      "Pending review ended#{actor_description}; task status changed to #{new_status}"
+    end
+    Service::VolunteerApprovalReminder.outcome_attributes(self, outcome: outcome).fetch(:approval_notification, {})
+  end
+
+  def close_pending_review_notification!(notification)
+    return if notification.empty?
+
+    Service::VolunteerApprovalReminder.sync_closed!(self)
   end
 
   private
+
+  def retire_approval_reminders_before_destruction
+    return unless persisted? && ticket_id.blank?
+
+    Service::VolunteerApprovalReminder.prepare_task_destruction!(self)
+  end
 
   # Build and save a child task document for multi-use claim patterns.
   def create_child_task!(member)
@@ -252,6 +435,7 @@ class VolunteerTask
       description:   description,
       credit_value:  credit_value,
       shop_id:       shop_id,
+      prerequisite_tool_ids: Array(prerequisite_tool_ids),
       created_by_id: created_by_id,
       parent_task_id: id,
       status:        'claimed',
@@ -276,7 +460,7 @@ class VolunteerTask
   end
 
   def credit_value_within_max
-    max = VolunteerTask.max_credit_value
+    max = ticket_id ? VolunteerTask.ticket_bounty_max_credit : VolunteerTask.max_credit_value
     if credit_value && credit_value > max
       errors.add(:credit_value, "cannot exceed #{max} credits (current maximum). Contact an admin to increase the limit.")
     end
@@ -286,6 +470,34 @@ class VolunteerTask
     if status == 'recurring' && days.blank?
       errors.add(:days, 'must be set for recurring tasks')
     end
+  end
+
+  def prerequisites_belong_to_shop
+    ids = Array(prerequisite_tool_ids).map(&:to_s).reject(&:blank?).uniq
+    return if ids.empty?
+
+    if shop_id.blank?
+      errors.add(:prerequisite_tool_ids, 'require an associated shop')
+      return
+    end
+
+    valid_ids = Tool.where(shop_id: shop_id, :id.in => ids).pluck(:id).map(&:to_s)
+    errors.add(:prerequisite_tool_ids, 'must belong to the associated shop') unless (ids - valid_ids).empty?
+  end
+
+  def enqueue_volunteer_canvas_sync(struck_task_id: nil)
+    effective_shop_id = shop_id || parent_task&.shop_id
+    return if effective_shop_id.blank?
+
+    VolunteerSlackCanvasSyncJob.perform_later(
+      effective_shop_id.to_s,
+      struck_task_id&.to_s
+    )
+  rescue => error
+    Rails.logger.error(
+      "[VolunteerSlackCanvasEnqueueError] task_id=#{id} error=#{error.class}: #{error.message}"
+    )
+    Honeybadger.notify(error) if defined?(Honeybadger)
   end
 
   def notify_task_verified(verifier)
@@ -298,7 +510,7 @@ class VolunteerTask
       VolunteerCredit.pending_slack_channel
     )
   rescue => e
-    Honeybadger.notify(e) if defined?(Honeybadger)
+    Service::ErrorReporter.notify(e)
   end
 
   def notify_member_task_released(member_id, reason)
@@ -311,7 +523,7 @@ class VolunteerTask
       slack_user.slack_id
     )
   rescue => e
-    Honeybadger.notify(e) if defined?(Honeybadger)
+    Service::ErrorReporter.notify(e)
   end
 
   def notify_member_task_rejected(member_id, reason)
@@ -324,6 +536,6 @@ class VolunteerTask
       slack_user.slack_id
     )
   rescue => e
-    Honeybadger.notify(e) if defined?(Honeybadger)
+    Service::ErrorReporter.notify(e)
   end
 end

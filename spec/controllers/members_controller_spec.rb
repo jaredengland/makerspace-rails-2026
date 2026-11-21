@@ -12,6 +12,31 @@ RSpec.describe MembersController, type: :controller do
         expect(response).to have_http_status(200)
         expect(response.media_type).to eq "application/json"
         expect(parsed_response.last['id']).to eq(Member.last.id.as_json)
+        expect(parsed_response.last).to have_key("provisioning")
+      end
+
+      it "hides soft-deleted members by default" do
+        visible = create(:member)
+        ghost = create(:member)
+        ghost.update_attribute(:merged_at, Time.current)
+
+        get :index, params: {}, format: :json
+
+        ids = JSON.parse(response.body).map { |m| m['id'] }
+        expect(ids).to include(visible.id.as_json)
+        expect(ids).not_to include(ghost.id.as_json)
+      end
+
+      it "shows only soft-deleted members when show_deleted is requested" do
+        visible = create(:member)
+        ghost = create(:member)
+        ghost.update_attribute(:merged_at, Time.current)
+
+        get :index, params: { show_deleted: true }, format: :json
+
+        ids = JSON.parse(response.body).map { |m| m['id'] }
+        expect(ids).to include(ghost.id.as_json)
+        expect(ids).not_to include(visible.id.as_json)
       end
 
       it "filters to current members when current_members param is true" do
@@ -55,6 +80,7 @@ RSpec.describe MembersController, type: :controller do
         expect(response).to have_http_status(200)
         expect(response.media_type).to eq "application/json"
         expect(parsed_response).not_to be_empty
+        expect(parsed_response.first).not_to have_key("provisioning")
       end
 
       it "can search members by name" do
@@ -88,6 +114,7 @@ RSpec.describe MembersController, type: :controller do
         expect(response).to have_http_status(200)
         expect(parsed_response.length).to eq(1)
         expect(parsed_response.first['id']).to eq(current_user.id.as_json)
+        expect(parsed_response.first).not_to have_key("provisioning")
       end
 
       it "does not return other members even when searching" do
@@ -121,9 +148,59 @@ RSpec.describe MembersController, type: :controller do
       expect(parsed_response['id']).to eq(current_user.id.as_json)
     end
 
+    it "includes the current member's expiring payment card types" do
+      allow(Service::CardExpirationCheck).to receive(:card_types_for_member)
+        .with(current_user.id).and_return('Visa, Discover')
+
+      get :show, params: { id: current_user.to_param }, format: :json
+
+      parsed_response = JSON.parse(response.body)
+      expect(parsed_response['expiringPaymentCardTypes']).to eq('Visa, Discover')
+    end
+
     it "raises not found if member doesn't exist" do
       get :show, params: {id: "foo" }, format: :json
       expect(response).to have_http_status(404)
+    end
+  end
+
+  describe "GET #show for a privileged user" do
+    login_admin
+
+    it "flags a revoked member for manual Slack deactivation when no admin token is configured" do
+      allow(ENV).to receive(:[]).and_call_original
+      allow(ENV).to receive(:[]).with("SLACK_ADMIN_TOKEN").and_return(nil)
+      member = create(:member, status: "revoked")
+
+      get :show, params: { id: member.to_param }, format: :json
+
+      parsed_response = JSON.parse(response.body)
+      expect(response).to have_http_status(200)
+      expect(parsed_response["slackManualDeactivationRequired"]).to be true
+      expect(parsed_response).to have_key("provisioning")
+    end
+
+    it "does not request manual Slack deactivation when an admin token is configured" do
+      allow(ENV).to receive(:[]).and_call_original
+      allow(ENV).to receive(:[]).with("SLACK_ADMIN_TOKEN").and_return("xoxp-admin")
+      member = create(:member, status: "revoked")
+
+      get :show, params: { id: member.to_param }, format: :json
+
+      parsed_response = JSON.parse(response.body)
+      expect(response).to have_http_status(200)
+      expect(parsed_response["slackManualDeactivationRequired"]).to be false
+    end
+
+    it "includes another member's expiring payment card types for an admin" do
+      member = create(:member)
+      allow(Service::CardExpirationCheck).to receive(:card_types_for_member)
+        .with(member.id).and_return('Visa')
+
+      get :show, params: { id: member.to_param }, format: :json
+
+      parsed_response = JSON.parse(response.body)
+      expect(parsed_response['expiringPaymentCardTypes']).to eq('Visa')
     end
   end
 
@@ -202,6 +279,30 @@ RSpec.describe MembersController, type: :controller do
       member = create(:member)
       put :update, params: { id: member.id, member: member_params }, format: :json
       expect(response).to have_http_status(403)
+    end
+
+    it "rejects a signature containing injected HTML" do
+      injected_signature = "data:image/png;base64,' /><iframe src='http://169.254.169.254/latest/meta-data/'></iframe>"
+
+      expect(DocumentUploadJob).not_to receive(:perform_later)
+
+      put :update, params: { id: current_user.id, signature: injected_signature }, format: :json
+
+      expect(response).to have_http_status(422)
+    end
+
+    it "queues a member contract upload for a valid base64 signature" do
+      signature = "data:image/png;base64,#{Base64.strict_encode64('signature-bytes')}"
+
+      expect(DocumentUploadJob).to receive(:perform_later).with(
+        Base64.strict_encode64('signature-bytes'),
+        "member_contract",
+        current_user.id.as_json
+      )
+
+      put :update, params: { id: current_user.id, signature: signature }, format: :json
+
+      expect(response).to have_http_status(200)
     end
 
     it "raises forbidden when a resource manager updates another member" do

@@ -10,7 +10,7 @@ class VolunteerController < AuthenticationController
   # GET /api/volunteer/summary
   def summary
     member_id       = current_member.id
-    is_earned       = EarnedMembership.where(member_id: member_id).exists?
+    is_earned       = EarnedMembership.active.where(member_id: member_id).exists?
     year_count      = VolunteerCredit.year_count_for(member_id)
     lifetime_count  = VolunteerCredit.lifetime_count_for(member_id)
     rolling_days    = (SystemConfig.get('volunteer_rolling_days') || 90).to_i
@@ -63,7 +63,8 @@ class VolunteerController < AuthenticationController
     tasks = VolunteerTask.claimable
                          .where(parent_task_id: nil)
                          .order_by(task_number: :asc)
-    render json: tasks, each_serializer: VolunteerTaskSerializer, adapter: :attributes
+    tasks = tasks.to_a.select { |task| task.eligible_for?(current_member) }
+    render json: tasks, each_serializer: VolunteerTaskSerializer, adapter: :attributes, scope: current_member
   end
 
   # GET /api/volunteer/tasks/my_claims
@@ -92,30 +93,38 @@ class VolunteerController < AuthenticationController
                    .sort_by { |t| t.claimed_at || Time.at(0) }
                    .reverse
 
-    render json: all_claims, each_serializer: VolunteerTaskSerializer, adapter: :attributes
+    render json: all_claims, each_serializer: VolunteerTaskSerializer, adapter: :attributes, scope: current_member
   end
 
   # GET /api/volunteer/events
   def events
-    events = VolunteerEvent.active_events.order_by(created_at: :desc)
+    events = VolunteerEvent.claimable_events.order_by(created_at: :desc)
+    events = events.to_a.select { |event| event.eligible_for?(current_member) } unless privileged_volunteer_member?
     render json: events, each_serializer: VolunteerEventSerializer, adapter: :attributes
   end
 
   # POST /api/volunteer/tasks/:id/claim
   def claim_task
-    unless current_member.status == 'activeMember'
+    unless current_member.status == "activeMember"
       render json: { error: 'Only active members may claim tasks' }, status: :forbidden and return
     end
 
     task = VolunteerTask.find(params[:id])
     raise ::Mongoid::Errors::DocumentNotFound.new(VolunteerTask, { id: params[:id] }) if task.nil?
 
+    unless task.eligible_for?(current_member)
+      names = task.missing_prerequisite_tool_names(current_member)
+      render json: {
+        error: "You need active checkouts for: #{names.join(', ')}"
+      }, status: :forbidden and return
+    end
+
     result = task.claim!(current_member)
 
     # For multi-use tasks the return value is the child task document;
     # for standard tasks claim! returns self after updating in place.
     render_target = result.is_a?(VolunteerTask) ? result : task
-    render json: render_target, serializer: VolunteerTaskSerializer, adapter: :attributes
+    render json: render_target, serializer: VolunteerTaskSerializer, adapter: :attributes, scope: current_member
   rescue Error::AlreadyClaimed
     render json: { error: 'You have already claimed this task' }, status: :unprocessable_content
   rescue Error::CoolingDown
@@ -136,7 +145,7 @@ class VolunteerController < AuthenticationController
       VolunteerCredit.pending_slack_channel
     )
 
-    render json: task, serializer: VolunteerTaskSerializer, adapter: :attributes
+    render json: task, serializer: VolunteerTaskSerializer, adapter: :attributes, scope: current_member
   rescue Error::Forbidden
     render json: { error: 'You cannot mark this task as complete' }, status: :unprocessable_content
   end
@@ -146,7 +155,7 @@ class VolunteerController < AuthenticationController
     event = VolunteerEvent.find(params[:id])
     raise ::Mongoid::Errors::DocumentNotFound.new(VolunteerEvent, { id: params[:id] }) if event.nil?
 
-    unless current_member.status == 'activeMember'
+    unless current_member.active_membership_status?
       render json: { error: 'Only active members may check in to events' }, status: :forbidden and return
     end
 
@@ -160,6 +169,13 @@ class VolunteerController < AuthenticationController
 
     if event.attendee_ids.include?(current_member.id)
       render json: { error: 'You are already checked in to this event' }, status: :unprocessable_content and return
+    end
+
+    unless event.eligible_for?(current_member)
+      names = event.missing_prerequisite_tool_names(current_member)
+      render json: {
+        error: "You need active checkouts for: #{names.join(', ')}"
+      }, status: :forbidden and return
     end
 
     event.checkin!(current_member)
@@ -185,5 +201,11 @@ class VolunteerController < AuthenticationController
     render json: event, serializer: VolunteerEventSerializer, adapter: :attributes
   rescue Error::Forbidden
     render json: { error: 'Unable to remove check-in. The event may already be closed.' }, status: :unprocessable_content
+  end
+
+  private
+
+  def privileged_volunteer_member?
+    %w[admin board_member resource_manager].include?(current_member.role)
   end
 end

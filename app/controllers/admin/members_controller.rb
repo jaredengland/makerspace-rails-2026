@@ -1,20 +1,24 @@
 class Admin::MembersController < AdminController
   include Service::GoogleDrive
-  before_action :set_member, only: [:update, :update_password, :send_password_reset, :invite_google_drive, :invite_slack]
+  before_action :set_member, only: [:update, :update_password, :send_password_reset, :invite_google_drive, :invite_slack, :soft_delete, :restore]
 
   def create
     permitted_params = get_camel_case_params(create_member_params())
+    normalize_and_validate_rm_assignments!(permitted_params)
     authorize_silence_emails_change!(permitted_params, Member.new(status: permitted_params[:status]))
 
     @member = Member.new(permitted_params)
     @member.save!
     @member.reload
     send_welcome_email
-    render json: @member, adapter: :attributes and return
+    enqueue_rm_canvas_access_sync([], rm_shop_ids_for(@member))
+    render json: @member, serializer: MemberSerializer, adapter: :attributes,
+      include_provisioning: true and return
   end
 
   def update
     before = @member.attributes.dup
+    previous_rm_shop_ids = rm_shop_ids_for(@member)
     date = @member.expirationTime
     becoming_revoked   = params[:status] == 'revoked'   && @member.status != 'revoked'
     becoming_suspended = params[:status] == 'suspended' && @member.status != 'suspended'
@@ -22,7 +26,9 @@ class Admin::MembersController < AdminController
     @member.skip_email_deliverability_validation = true if becoming_revoked
 
     permitted_params = get_camel_case_params(update_member_params())
+    normalize_and_validate_rm_assignments!(permitted_params, @member)
     authorize_silence_emails_change!(permitted_params, @member)
+    apply_google_drive_provisioning_block!(permitted_params)
 
     @member.update!(permitted_params)
 
@@ -37,13 +43,17 @@ class Admin::MembersController < AdminController
 
     if becoming_revoked
       handle_revocation
+      RentalLapseNotifier.notify_event(@member, reason: :revoked)
     elsif becoming_suspended
       invalidate_member_sessions
+      RentalLapseNotifier.notify_event(@member, reason: :suspended)
     end
 
     notify_renewal(date)
 
     @member.reload
+
+    HouseholdSetupReminder.notify(@member, trigger: :renewal) if date != @member.expirationTime
 
     # Log membership revocation as its own dedicated event
     if becoming_revoked
@@ -74,7 +84,13 @@ class Admin::MembersController < AdminController
       )
     end
 
-    render json: @member, adapter: :attributes and return
+    enqueue_rm_canvas_access_sync(
+      previous_rm_shop_ids,
+      rm_shop_ids_for(@member)
+    )
+
+    render json: @member, serializer: MemberSerializer, adapter: :attributes,
+      include_provisioning: true and return
   end
 
   # POST /api/admin/members/:id/update_password
@@ -111,12 +127,12 @@ class Admin::MembersController < AdminController
   # POST /api/admin/members/:id/invite_google_drive
   # Re-sends a Google Drive folder invite to the member.
   def invite_google_drive
-    invite_gdrive(@member.email)
+    ::Service::MemberProvisioning.provision_google(@member, raise_errors: true, force: true)
     render json: {}, status: 204 and return
   rescue Error::NotAllowed => e
     render json: { message: e.message }, status: :unprocessable_content and return
   rescue => e
-    Honeybadger.notify(e) if defined?(Honeybadger)
+    Service::ErrorReporter.notify(e)
     render json: { message: e.message }, status: :unprocessable_content and return
   end
 
@@ -125,12 +141,49 @@ class Admin::MembersController < AdminController
   # Safe to call even if the member is already in the workspace — Slack
   # will return an error which is surfaced to the admin.
   def invite_slack
-    ::Service::SlackConnector.invite_to_slack(@member.email, @member.lastname, @member.firstname)
+    ::Service::MemberProvisioning.invite_slack(@member, raise_errors: true)
     render json: {}, status: 204 and return
   rescue Error::NotAllowed => e
     render json: { message: e.message }, status: :unprocessable_content and return
   rescue => e
-    Honeybadger.notify(e) if defined?(Honeybadger)
+    Service::ErrorReporter.notify(e)
+    render json: { message: e.message }, status: :unprocessable_content and return
+  end
+
+  # POST /api/admin/members/:id/soft_delete
+  # Marks a duplicate/abandoned ("ghost") account as deleted -- revokes its
+  # access, hides it from normal member queries, and frees its email for
+  # reuse. Refuses to run on a currently-active, unexpired, or subscribed
+  # member, or on one with an open invoice. Removes the member from Slack and
+  # the managed Google Drive folders and sets the status to inactive. Never
+  # notifies the member.
+  #
+  # If a Slack or Drive removal fails, responds 422 with manual_removal_required: true
+  # and the list of problems. The admin removes them by hand and repeats the request
+  # with manual_removal_confirmed=true to finish; that confirmation is audited.
+  def soft_delete
+    confirmed = ActiveModel::Type::Boolean.new.cast(params[:manual_removal_confirmed]) || false
+    ::Service::MemberSoftDelete.delete!(@member, actor: current_member, manual_removal_confirmed: confirmed)
+    render json: @member, serializer: MemberSerializer, adapter: :attributes,
+      include_provisioning: true and return
+  rescue Service::MemberSoftDelete::ManualRemovalRequiredError => e
+    render json: { message: e.message, manual_removal_required: true, problems: e.problems },
+      status: :unprocessable_content and return
+  rescue Service::MemberSoftDelete::OpenInvoicesError => e
+    render json: { message: e.message, open_invoices: e.count }, status: :unprocessable_content and return
+  rescue Service::MemberSoftDelete::ActiveMembershipError, Service::MemberSoftDelete::AlreadyDeletedError => e
+    render json: { message: e.message }, status: :unprocessable_content and return
+  end
+
+  # POST /api/admin/members/:id/restore
+  # Un-deletes a soft-deleted account. Does not re-provision Drive/Slack
+  # access or restore a cancelled subscription -- those go through the
+  # normal invite/renewal flows once restored.
+  def restore
+    ::Service::MemberSoftDelete.restore!(@member, actor: current_member)
+    render json: @member, serializer: MemberSerializer, adapter: :attributes,
+      include_provisioning: true and return
+  rescue Service::MemberSoftDelete::NotDeletedError => e
     render json: { message: e.message }, status: :unprocessable_content and return
   end
 
@@ -139,33 +192,7 @@ class Admin::MembersController < AdminController
   # Cancel subscription, revoke Drive/Slack access, and invalidate all sessions
   # when a member's status is set to revoked.
   def handle_revocation
-    # Cancel Braintree subscription if present
-    if @member.subscription_id
-      begin
-        ::BraintreeService::Subscription.cancel(connect_gateway, @member.subscription_id)
-      rescue => e
-        ::Service::SlackConnector.send_slack_message(
-          "⚠️ Error cancelling subscription for revoked member #{@member.fullname}: #{e.message}",
-          ::Service::SlackConnector.logs_channel
-        )
-      end
-    end
-
-    # Revoke Google Drive and Slack access
-    begin
-      Service::MemberAccess.revoke(@member)
-    rescue => e
-      ::Service::SlackConnector.send_slack_message(
-        "⚠️ Error revoking Drive/Slack access for #{@member.fullname}: #{e.message}",
-        ::Service::SlackConnector.logs_channel
-      )
-    end
-
-    # Keep marketing mail silenced; revoked status suppresses direct member email/Slack notifications.
-    @member.update_attribute(:silence_emails, true)
-
-    # Rotate session token to invalidate any active portal sessions
-    invalidate_member_sessions
+    Service::MemberAccess.full_deprovision(@member)
   end
 
   # Rotate session token to invalidate any active portal sessions
@@ -195,12 +222,36 @@ class Admin::MembersController < AdminController
   def create_member_params
     params.require([:firstname, :lastname, :email])
     params.permit(:firstname, :lastname, :role, :email, :status,
-      :silence_emails, :member_contract_on_file, :phone, :notes, address: [:street, :city, :state, :postal_code])
+      :silence_emails, :member_contract_on_file, :phone, :notes,
+      :signup_source, :signup_source_detail, :referred_by_member_id, :signup_eventbrite_event_id,
+      resource_manager_shop_ids: [], resourceManagerShopIds: [],
+      address: [:street, :city, :state, :postal_code])
   end
 
   def update_member_params
     params.permit(:firstname, :lastname, :role, :status, :expiration_time, :renew, :member_contract_on_file, :notes,
-      :silence_emails, :phone, :subscription, :email, address: [:street, :unit, :city, :state, :postal_code])
+      :signup_source, :signup_source_detail, :referred_by_member_id, :signup_eventbrite_event_id,
+      :silence_emails, :phone, :subscription, :email, :google_drive_provisioning_blocked,
+      resource_manager_shop_ids: [], resourceManagerShopIds: [],
+      address: [:street, :unit, :city, :state, :postal_code])
+  end
+
+  # Admin-settable on/off toggle for Google Drive provisioning, surfaced as a
+  # single boolean on the member profile. Translates it into the underlying
+  # google_provisioning_blocked_at/reason fields (also set automatically by
+  # provision_google on a permanent failure -- see Service::MemberProvisioning)
+  # so both paths share one meaning: "not currently being retried."
+  def apply_google_drive_provisioning_block!(permitted_params)
+    return unless permitted_params.key?(:google_drive_provisioning_blocked)
+
+    blocked = ActiveModel::Type::Boolean.new.cast(permitted_params.delete(:google_drive_provisioning_blocked))
+    if blocked
+      permitted_params[:google_provisioning_blocked_at] = Time.current
+      permitted_params[:google_provisioning_blocked_reason] = "Manually blocked by #{current_member.fullname}"
+    else
+      permitted_params[:google_provisioning_blocked_at] = nil
+      permitted_params[:google_provisioning_blocked_reason] = nil
+    end
   end
 
   def password_params
@@ -214,10 +265,61 @@ class Admin::MembersController < AdminController
       member_contract_on_file: :memberContractOnFile,
     }
     params = member_params
+    if params[:resourceManagerShopIds].present? || params.key?(:resourceManagerShopIds)
+      params[:resource_manager_shop_ids] = params.delete(:resourceManagerShopIds)
+    end
     camel_case_props.each do | key, value|
       params[value] = params.delete(key) unless params[key].nil?
     end
     params
+  end
+
+  # Board members and admins can also be tagged with resource_manager_shop_ids
+  # -- not for authority (they already manage every shop via can_manage_shop?)
+  # but so they can be listed as a shop's point-of-contact (e.g. on the
+  # workshop page) when that's actually who members should reach out to.
+  # Only role "member" has no meaning for this field and always clears it.
+  # A plain resource_manager still requires at least one shop, since that's
+  # their sole source of authority; for admin/board_member it's optional.
+  def normalize_and_validate_rm_assignments!(permitted_params, member = nil)
+    role = permitted_params[:role].presence || member&.role
+    unless Member::RESOURCE_MANAGER_TAGGABLE_ROLES.include?(role)
+      permitted_params[:resource_manager_shop_ids] = [] if permitted_params.key?(:role) || permitted_params.key?(:resource_manager_shop_ids)
+      return
+    end
+
+    return unless role == "resource_manager" || permitted_params.key?(:resource_manager_shop_ids)
+
+    ids = if permitted_params.key?(:resource_manager_shop_ids)
+      Array(permitted_params[:resource_manager_shop_ids]).map(&:to_s).uniq
+    else
+      Array(member&.resource_manager_shop_ids).map(&:to_s)
+    end
+    raise ::Error::UnprocessableEntity.new("Select at least one shop for a Resource Manager") if role == "resource_manager" && ids.empty?
+
+    valid_ids = Shop.where(:id.in => ids).pluck(:id).map(&:to_s)
+    raise ::Error::UnprocessableEntity.new("One or more Resource Manager shops are invalid") unless (ids - valid_ids).empty?
+    permitted_params[:resource_manager_shop_ids] = ids
+  end
+
+  def rm_shop_ids_for(member)
+    return [] unless %w[resource_manager admin board_member].include?(member.role)
+
+    Array(member.resource_manager_shop_ids).map(&:to_s).uniq
+  end
+
+  def enqueue_rm_canvas_access_sync(previous_shop_ids, current_shop_ids)
+    previous_shop_ids = Array(previous_shop_ids).map(&:to_s).uniq
+    current_shop_ids = Array(current_shop_ids).map(&:to_s).uniq
+    return if previous_shop_ids.sort == current_shop_ids.sort
+
+    affected_shop_ids = previous_shop_ids | current_shop_ids
+    return if affected_shop_ids.empty?
+
+    ReservationSlackCanvasMemberAccessJob.perform_later(
+      @member.id.to_s,
+      affected_shop_ids
+    )
   end
 
   def set_member

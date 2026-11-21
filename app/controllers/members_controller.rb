@@ -3,7 +3,15 @@ class MembersController < AuthenticationController
     before_action :set_member, only: [:show, :update]
 
     def index
-      base_query = Member.includes(:access_cards).includes(:earned_membership).includes(:slack_user).includes(:mailtrap_event)
+      # Soft-deleted ("ghost") members are hidden by Member's default_scope
+      # everywhere else; only admins/board members explicitly opting in to
+      # see them (e.g. to restore one, or check whether an email is already
+      # in use by a ghost) bypass it here -- and see *only* ghosts, not a
+      # mixed list, so this is a distinct view rather than an additive filter.
+      show_deleted = (is_admin? || is_board_member?) &&
+        to_bool(search_params[:show_deleted] || search_params[:showDeleted])
+      member_scope = show_deleted ? Member.unscoped.where(:merged_at.ne => nil) : Member
+      base_query = member_scope.includes(:access_cards).includes(:earned_membership).includes(:slack_user).includes(:mailtrap_event)
 
       limited_checkout_approver_search = false
 
@@ -29,23 +37,31 @@ class MembersController < AuthenticationController
         search = base_query.where(id: current_member.id)
       end
 
+      if to_bool(search_params[:fully_active_unexpired])
+        search = search.where(status: 'activeMember', :expirationTime.gt => Time.now.to_i * 1000)
+      end
+
       @members = query_resource(search)
       if limited_checkout_approver_search
         return render_with_total_items(@members, { each_serializer: LimitedMemberSerializer, adapter: :attributes })
       end
 
       members = @members.to_a
+      events_by_key = mailtrap_events_by_member_id_email(members)
       return render_with_total_items(members, {
         each_serializer: MemberSummarySerializer,
         adapter: :attributes,
-        mailtrap_events_by_member_id_email: mailtrap_events_by_member_id_email(members)
+        mailtrap_events_by_member_id_email: events_by_key,
+        mailtrap_messages_by_member_id_email: mailtrap_messages_by_member_id_email(members, events_by_key),
+        include_provisioning: is_admin? || is_board_member?
       })
     end
 
     def show
         raise Error::NotFound.new unless defined?(@member.id)
          if @member.id == current_member.id || is_admin? || is_board_member? || is_resource_manager?
-            render json: @member, serializer: MemberSerializer, adapter: :attributes and return
+            render json: @member, serializer: MemberSerializer, adapter: :attributes,
+              include_provisioning: is_admin? || is_board_member?, viewer: current_member and return
          else
              Rails.logger.warn("Calling show for #{@member.id} while logged in as #{@current_member.id}!")
              raise Error::Forbidden.new
@@ -64,6 +80,7 @@ class MembersController < AuthenticationController
 
       if signature_params[:signature]
          encoded_signature = signature_params[:signature].split(",")[1]
+         encoded_signature = ::Service::GoogleDrive.sanitize_base64_signature(encoded_signature)
          DocumentUploadJob.perform_later(encoded_signature, "member_contract", @member.id.as_json)
          @member.update_attributes!(member_contract_signed_date: Date.today)
 
@@ -118,6 +135,22 @@ class MembersController < AuthenticationController
         end
     end
 
+    # Newest send record per member and current address, loaded only for members
+    # with no matching Mailtrap event (the serializer reports those as "sent").
+    def mailtrap_messages_by_member_id_email(members, events_by_key)
+      pairs = members.map { |member| [member.id, member.email.to_s.downcase] }
+        .reject { |id, email| email.blank? || events_by_key.key?([id.to_s, email]) }
+      return {} if pairs.empty?
+
+      MailtrapMessage
+        .where(:member_id.in => pairs.map(&:first), :email.in => pairs.map(&:last).uniq)
+        .desc(:created_at)
+        .each_with_object({}) do |message, messages_by_key|
+          key = [message.member_id.to_s, message.email.to_s.downcase]
+          messages_by_key[key] ||= message
+        end
+    end
+
     def set_member
       @member = Member.find(params[:id])
       raise ::Mongoid::Errors::DocumentNotFound.new(Member, { id: params[:id] }) if @member.nil?
@@ -156,6 +189,6 @@ class MembersController < AuthenticationController
     end
 
     def search_params
-      params.permit(:current_members, :currentMembers, :format, :member, :page_num, :pageNum, :order_by, :orderBy, :order, :search)
+      params.permit(:fully_active_unexpired, :current_members, :currentMembers, :show_deleted, :showDeleted, :format, :member, :page_num, :pageNum, :order_by, :orderBy, :order, :search)
     end
 end

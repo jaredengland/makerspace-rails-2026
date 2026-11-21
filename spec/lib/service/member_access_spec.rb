@@ -2,6 +2,12 @@ require 'rails_helper'
 
 RSpec.describe Service::MemberAccess do
   describe '.revoke_slack_access' do
+    before do
+      allow(Honeybadger).to receive(:notify) if defined?(Honeybadger)
+      allow(ENV).to receive(:[]).and_call_original
+      allow(ENV).to receive(:[]).with('SLACK_BOT_TOKEN').and_return(nil)
+    end
+
     it 'alerts and pins a manual revocation message when the Slack admin token is missing' do
       member = create(:member, firstname: 'Revoked', lastname: 'Member')
       SlackUser.create!(member: member, slack_id: 'U_REVOKED')
@@ -44,6 +50,63 @@ RSpec.describe Service::MemberAccess do
         Service::SlackConnector.admin_channel
       )
       expect(Service::SlackConnector).to have_received(:pin_slack_message).with(Service::SlackConnector.admin_channel, '789.012')
+    end
+
+    it 'returns the failure without alerting the channel when alert: false, and names deleted members in the alert wording' do
+      member = create(:member, firstname: 'Deleted', lastname: 'Member')
+      slack_client = instance_double(Slack::Web::Client)
+      slack_user = OpenStruct.new(user: OpenStruct.new(id: 'U_LOOKUP'))
+
+      allow(ENV).to receive(:[]).and_call_original
+      allow(ENV).to receive(:[]).with('SLACK_ADMIN_TOKEN').and_return('admin-token')
+      allow(Slack::Web::Client).to receive(:new).with(token: 'admin-token').and_return(slack_client)
+      allow(slack_client).to receive(:users_lookupByEmail).with(email: member.email).and_return(slack_user)
+      allow(slack_client).to receive(:users_admin_setInactive).and_raise(StandardError.new('inactive failed'))
+      allow(Service::SlackConnector).to receive(:send_slack_message).and_return(double('SlackResponse', ts: '1.2'))
+      allow(Service::SlackConnector).to receive(:pin_slack_message)
+
+      quiet = described_class.revoke_slack_access(member, alert: false)
+
+      expect(quiet).to eq(status: :error, message: 'inactive failed')
+      expect(Service::SlackConnector).not_to have_received(:send_slack_message)
+
+      described_class.revoke_slack_access(member)
+
+      expect(Service::SlackConnector).to have_received(:send_slack_message).with(
+        /for revoked or deleted member Deleted Member.*This member must be manually disabled/,
+        Service::SlackConnector.admin_channel
+      )
+    end
+
+    it 'uses the bot token for lookup and the admin token for deactivation' do
+      member = create(:member, firstname: 'Revoked', lastname: 'Member')
+      bot_client = instance_double(Slack::Web::Client)
+      admin_client = instance_double(Slack::Web::Client)
+      slack_user = OpenStruct.new(user: OpenStruct.new(id: 'U_LOOKUP'))
+
+      allow(ENV).to receive(:[]).and_call_original
+      allow(ENV).to receive(:[]).with('SLACK_BOT_TOKEN').and_return('bot-token')
+      allow(ENV).to receive(:[]).with('SLACK_ADMIN_TOKEN').and_return('admin-token')
+      allow(Slack::Web::Client).to receive(:new)
+        .with(token: 'bot-token')
+        .and_return(bot_client)
+      allow(Slack::Web::Client).to receive(:new)
+        .with(token: 'admin-token')
+        .and_return(admin_client)
+      allow(bot_client).to receive(:users_lookupByEmail)
+        .with(email: member.email)
+        .and_return(slack_user)
+      allow(admin_client).to receive(:users_admin_setInactive)
+        .with(user: 'U_LOOKUP')
+
+      result = described_class.revoke_slack_access(member)
+
+      expect(result).to eq(
+        status: :ok,
+        message: "Deactivated Slack user for #{member.email}"
+      )
+      expect(bot_client).to have_received(:users_lookupByEmail)
+      expect(admin_client).to have_received(:users_admin_setInactive)
     end
 
 
@@ -89,6 +152,168 @@ RSpec.describe Service::MemberAccess do
         Service::SlackConnector.admin_channel
       )
       expect(Service::SlackConnector).to have_received(:pin_slack_message).with(Service::SlackConnector.admin_channel, '234.567')
+    end
+  end
+
+  describe '.full_deprovision' do
+    it 'cancels a live subscription, revokes access, silences emails, and rotates the session token' do
+      member = create(:member, subscription_id: 'sub-123')
+      original_session_token = member.session_token
+      gateway = double('gateway')
+
+      allow(Service::BraintreeGateway).to receive(:connect_gateway).and_return(gateway)
+      allow(BraintreeService::Subscription).to receive(:cancel)
+      allow(described_class).to receive(:revoke)
+
+      described_class.full_deprovision(member)
+
+      expect(BraintreeService::Subscription).to have_received(:cancel).with(gateway, 'sub-123')
+      expect(described_class).to have_received(:revoke).with(member, alert: true)
+      expect(member.reload.silence_emails).to be true
+      expect(member.reload.session_token).not_to eq(original_session_token)
+    end
+
+    it 'returns the result of each step and passes alert: false through to the revoke' do
+      member = create(:member, subscription_id: 'sub-789')
+      allow(Service::BraintreeGateway).to receive(:connect_gateway).and_return(double('gateway'))
+      allow(BraintreeService::Subscription).to receive(:cancel)
+      allow(described_class).to receive(:revoke).and_return(slack: { status: :ok }, gdrive_resources: { status: :not_found })
+
+      results = described_class.full_deprovision(member, alert: false)
+
+      expect(described_class).to have_received(:revoke).with(member, alert: false)
+      expect(results).to eq(subscription: { status: :ok }, slack: { status: :ok }, gdrive_resources: { status: :not_found })
+    end
+
+    it 'reports a failed subscription cancellation in the results' do
+      member = create(:member, subscription_id: 'sub-456')
+      allow(Service::BraintreeGateway).to receive(:connect_gateway).and_return(double('gateway'))
+      allow(BraintreeService::Subscription).to receive(:cancel).and_raise(StandardError.new('braintree down'))
+      allow(described_class).to receive(:revoke).and_return({})
+      allow(Service::SlackConnector).to receive(:send_slack_message)
+
+      results = described_class.full_deprovision(member, alert: false)
+
+      expect(results[:subscription]).to eq(status: :error, message: 'braintree down')
+    end
+
+    it 'skips subscription cancellation when there is no subscription_id' do
+      member = create(:member, subscription_id: nil)
+      allow(described_class).to receive(:revoke)
+      allow(BraintreeService::Subscription).to receive(:cancel)
+
+      described_class.full_deprovision(member)
+
+      expect(BraintreeService::Subscription).not_to have_received(:cancel)
+    end
+
+    it 'alerts instead of raising when subscription cancellation fails' do
+      member = create(:member, subscription_id: 'sub-456')
+      allow(Service::BraintreeGateway).to receive(:connect_gateway).and_return(double('gateway'))
+      allow(BraintreeService::Subscription).to receive(:cancel).and_raise(StandardError.new('braintree down'))
+      allow(described_class).to receive(:revoke)
+      allow(Service::SlackConnector).to receive(:send_slack_message)
+
+      expect { described_class.full_deprovision(member) }.not_to raise_error
+      expect(Service::SlackConnector).to have_received(:send_slack_message).with(
+        /Error cancelling subscription.*braintree down/,
+        Service::SlackConnector.logs_channel
+      )
+    end
+  end
+
+  describe '.revoke_gdrive_folder' do
+    let(:member) { create(:member, firstname: 'Revoked', lastname: 'Member') }
+    let(:drive) { instance_double(Google::Apis::DriveV3::DriveService) }
+
+    before do
+      allow(Honeybadger).to receive(:notify) if defined?(Honeybadger)
+      allow(ENV).to receive(:[]).and_call_original
+      allow(ENV).to receive(:[]).with('GDRIVE_INVITES_ENABLED').and_return('true')
+      allow(Service::GoogleDrive).to receive(:load_gdrive).and_return(drive)
+    end
+
+    it 'passes supports_all_drives on list_permissions' do
+      allow(drive).to receive(:list_permissions).and_return(
+        OpenStruct.new(permissions: [])
+      )
+
+      described_class.revoke_gdrive_folder(member, 'shared-drive-folder', 'Resources (reader)')
+
+      expect(drive).to have_received(:list_permissions).with(
+        'shared-drive-folder',
+        fields: 'permissions(id,emailAddress,role)',
+        supports_all_drives: true
+      )
+    end
+
+    it 'passes supports_all_drives on delete_permission when a permission is found and removed' do
+      permission = OpenStruct.new(id: 'perm-1', email_address: member.email, role: 'reader')
+      allow(drive).to receive(:list_permissions).and_return(OpenStruct.new(permissions: [permission]))
+      allow(drive).to receive(:delete_permission)
+
+      result = described_class.revoke_gdrive_folder(member, 'shared-drive-folder', 'Resources (reader)')
+
+      expect(drive).to have_received(:delete_permission).with('shared-drive-folder', 'perm-1', supports_all_drives: true)
+      expect(result).to eq(status: :ok, message: 'Removed reader permission from Resources (reader)')
+    end
+
+    it 'alerts and pins instead of failing silently when the Drive API errors' do
+      response = double('SlackResponse', ts: '345.678')
+      allow(drive).to receive(:list_permissions).and_raise(StandardError.new('shared drive lookup failed'))
+      allow(Service::SlackConnector).to receive(:send_slack_message).and_return(response)
+      allow(Service::SlackConnector).to receive(:pin_slack_message)
+
+      result = described_class.revoke_gdrive_folder(member, 'shared-drive-folder', 'Resources (reader)')
+
+      expect(result).to eq(status: :error, message: 'shared drive lookup failed')
+      expect(Service::SlackConnector).to have_received(:send_slack_message).with(
+        /<!channel>.*Revoked Member.*Resources \(reader\).*must be manually removed by an admin.*shared drive lookup failed/,
+        Service::SlackConnector.admin_channel
+      )
+      expect(Service::SlackConnector).to have_received(:pin_slack_message).with(Service::SlackConnector.admin_channel, '345.678')
+      if defined?(Honeybadger)
+        expect(Honeybadger).to have_received(:notify).with(
+          anything,
+          hash_including(context: hash_including(member_id: member.id.to_s, member_email: member.email, label: 'Resources (reader)'))
+        )
+      end
+    end
+
+    it 'also removes a share that is still under the previous email address' do
+      member.set(google_previous_email: 'Old.Address@Example.com')
+      current = OpenStruct.new(id: 'perm-current', email_address: member.email, role: 'reader')
+      previous = OpenStruct.new(id: 'perm-old', email_address: 'old.address@example.com', role: 'reader')
+      other = OpenStruct.new(id: 'perm-other', email_address: 'someone.else@example.com', role: 'reader')
+      allow(drive).to receive(:list_permissions).and_return(OpenStruct.new(permissions: [current, previous, other]))
+      allow(drive).to receive(:delete_permission)
+
+      result = described_class.revoke_gdrive_folder(member, 'shared-drive-folder', 'Resources (reader)')
+
+      expect(drive).to have_received(:delete_permission).with('shared-drive-folder', 'perm-current', supports_all_drives: true)
+      expect(drive).to have_received(:delete_permission).with('shared-drive-folder', 'perm-old', supports_all_drives: true)
+      expect(drive).not_to have_received(:delete_permission).with('shared-drive-folder', 'perm-other', anything)
+      expect(result[:status]).to eq(:ok)
+    end
+
+    it 'returns the error without alerting the channel when alert: false' do
+      allow(drive).to receive(:list_permissions).and_raise(StandardError.new('shared drive lookup failed'))
+      allow(Service::SlackConnector).to receive(:send_slack_message)
+
+      result = described_class.revoke_gdrive_folder(member, 'shared-drive-folder', 'Resources (reader)', alert: false)
+
+      expect(result).to eq(status: :error, message: 'shared drive lookup failed')
+      expect(Service::SlackConnector).not_to have_received(:send_slack_message)
+    end
+
+    it 'does not alert when the folder env var is not configured' do
+      allow(Service::SlackConnector).to receive(:send_slack_message)
+
+      result = described_class.revoke_gdrive_folder(member, nil, 'Resources (reader)')
+
+      expect(result).to eq(status: :skipped, reason: 'Resources (reader) folder env var not configured')
+      expect(Service::SlackConnector).not_to have_received(:send_slack_message)
+      expect(Service::GoogleDrive).not_to have_received(:load_gdrive)
     end
   end
 end

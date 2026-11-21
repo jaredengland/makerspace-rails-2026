@@ -17,13 +17,13 @@ class BillingMailer < ApplicationMailer
     @subscription = subscription
     @payment_method = payment_method
     @invoice = invoice
-    @google_doc_content = ::Service::EmailTemplate.render(:new_subscription, {
+    @google_doc_content = ::Service::EmailTemplate.render(:new_subscription, ::Service::EmailTemplate.common_variables(member).merge(
       member_name: member.fullname,
       friendly_type: invoice.resource_class == "member" ? "membership" : "rental",
       quantity: invoice.quantity.to_s,
       next_billing_date: Date.parse(subscription.billing_period_end_date.to_s).strftime("%m/%d/%Y"),
       url: get_profile_url_string(member)
-    })
+    ))
     send_mail(member.email, "Subscription to Manchester Makerspace", __method__.to_s)
   end
 
@@ -78,38 +78,44 @@ class BillingMailer < ApplicationMailer
     send_mail(member.email, "Refund Requested for transaction #{@transaction.id}", __method__.to_s)
   end
 
-  def canceled_subscription(email, invoice_resource_class)
+  def canceled_subscription(email, invoice_resource_class, cancellation_reason: "")
     member = Member.find_by(email: email.to_s.downcase)
-    _canceled_subscription(member, invoice_resource_class)
+    _canceled_subscription(member, invoice_resource_class, cancellation_reason)
   end
 
-  def _canceled_subscription(member, invoice_resource_class)
+  def _canceled_subscription(member, invoice_resource_class, cancellation_reason = "")
     @member = member
     @type = invoice_resource_class
-    @google_doc_content = ::Service::EmailTemplate.render(:canceled_subscription, {
+    @cancellation_reason = cancellation_reason
+    @google_doc_content = ::Service::EmailTemplate.render(:canceled_subscription, ::Service::EmailTemplate.common_variables(member).merge(
       member_name: member.fullname,
       friendly_type: invoice_resource_class == "member" ? "membership" : "rental",
+      cancellation_reason: cancellation_reason,
       url: get_profile_url_string(member)
-    })
+    ))
     send_mail(member.email, "Canceled Manchester Makerspace Subscription", __method__.to_s)
   end
 
-  def failed_payment(email, invoice_id, error_status)
+  # failure_reason is plain wording for why the charge failed (PaymentFailure), or nil when it is not known. The email template
+  # placeholder {{failure_reason}} receives it as a sentence ("Reason: insufficient funds."), or nothing.
+  def failed_payment(email, invoice_id, error_status, failure_reason = nil)
     member = Member.find_by(email: email.to_s.downcase)
     invoice = Invoice.find(invoice_id)
-    _failed_payment(member, invoice, error_status)
+    _failed_payment(member, invoice, error_status, failure_reason)
   end
 
-  def _failed_payment(member, invoice, error_status)
+  def _failed_payment(member, invoice, error_status, failure_reason = nil)
     @error_status = error_status
+    @failure_reason = failure_reason.presence
     @member = member
     @invoice = invoice
-    @google_doc_content = ::Service::EmailTemplate.render(:failed_payment, {
+    @google_doc_content = ::Service::EmailTemplate.render(:failed_payment, ::Service::EmailTemplate.common_variables(member).merge(
       member_name: member.fullname,
       friendly_type: invoice.resource_class == "member" ? "membership" : "rental",
       error_status: error_status.to_s,
+      failure_reason: @failure_reason ? "Reason: #{@failure_reason}." : "",
       url: get_profile_url_string(member)
-    })
+    ))
     send_mail(member.email, "Failed payment to Manchester Makerspace", __method__.to_s)
   end
 

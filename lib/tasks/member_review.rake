@@ -1,7 +1,7 @@
 desc "This task is called by the Heroku scheduler add-on and reviews membership statuses."
 task :member_review => :environment do
   should_run = Rails.env.production? ? !!Date.today.sunday? : true
-  @base_url = ActionMailer::Base.default_url_options[:host]
+  @base_url = Rails.configuration.x.app_base_url
 
   @management_messages = [
     {
@@ -41,10 +41,12 @@ task :member_review => :environment do
       # - expirationTime can be nil (member never paid)
       # Using either field alone misses cases — both are required.
       now_ms = Time.now.to_i * 1000
-      @expired_with_rentals = Rental.where(:status.in => ["active", "vacating"]).map(&:member).compact.select do |member|
+      # Only rentals still marked active need the member to act; a vacating rental is already
+      # being ended and staff see it in the 🟡 posts.
+      @expired_with_rentals = Rental.where(status: "active").map(&:member).compact.reject { |member| member.merged_at.present? }.select do |member|
         member.expirationTime.nil? ||
         member.expirationTime < now_ms ||
-        member.status != "activeMember"
+        !member.active_membership_status?
       end.uniq
 
       # Helpers
@@ -65,10 +67,14 @@ task :member_review => :environment do
           unless slack_user.nil?
             slack_activity = "INACTIVE"
 
-            team_info = ::Service::SlackConnector.client.team_billableInfo({ user: slack_user.slack_id })
-            is_slack_active = team_info.billable_info[slack_user.slack_id].billing_active
-            if is_slack_active
-              slack_activity = "ACTIVE"
+            team_info = ::Service::SlackConnector.team_billable_info(
+              user: slack_user.slack_id
+            )
+            if team_info
+              is_slack_active = team_info.billable_info[slack_user.slack_id].billing_active
+              slack_activity = "ACTIVE" if is_slack_active
+            else
+              slack_activity = "UNKNOWN"
             end
           end
 
@@ -97,6 +103,20 @@ task :member_review => :environment do
         ::Service::SlackConnector.send_slack_message(messages, slack_user.slack_id)
       end
 
+      def render_member_template(template, slack_user, variables = {})
+        member = Member.find(slack_user.member_id)
+        common = ::Service::EmailTemplate.common_variables(member).merge(
+          full_name: slack_user.real_name.presence || member.fullname,
+          slack_id: slack_user.slack_id
+        )
+        ::Service::EmailTemplate.render(
+          template,
+          common.merge(variables),
+          fallback: true,
+          format: :text
+        )
+      end
+
       # Construct Messages
       def notify_orientaion_message
         send_report(
@@ -104,7 +124,7 @@ task :member_review => :environment do
           "Members who need orientation",
           Proc.new do |slack_user| 
             notify_member(
-              "Hi #{slack_user.real_name}, please come to the next open house #{ENV["OPEN_HOUSE_SCHEDULE"]} to complete your new member orientation and recieve your key to start using the Makerspace!",
+              render_member_template(:member_review_orientation, slack_user),
               slack_user
             ) 
           end
@@ -122,7 +142,7 @@ task :member_review => :environment do
             "People who created an account but did not purchase membership",
             Proc.new do |slack_user| 
               notify_member(
-                "Hi #{slack_user.real_name}, we noticed you signed up but never purchased a membership. Is there anything we can help you with? Please come to the next open house #{ENV["OPEN_HOUSE_SCHEDULE"]} to meet the members and see the Makerspace.",
+                render_member_template(:member_review_no_purchase, slack_user),
                 slack_user
               ) 
             end
@@ -141,7 +161,7 @@ task :member_review => :environment do
             "Members who are still on PayPal billing",
             Proc.new do |slack_user| 
               notify_member(
-                "Hi #{slack_user.real_name}, it seems your membership is still tied to a PayPal account. Please help us finish moving memberships to our new payment provider by viewing your profile. You will not encounter any additional charges by moving your membership.",
+                render_member_template(:member_review_paypal, slack_user),
                 slack_user
               ) 
             end
@@ -155,7 +175,12 @@ task :member_review => :environment do
           "Members who need to sign #{contract_type}s",
           Proc.new do |slack_user| 
             notify_member(
-              "Hi #{slack_user.real_name}, we are missing a #{contract_type} from you and need this document in order to keep your membership in good standing. <#{@base_url}/members/#{slack_user.member_id}|Please login to complete the document>", 
+              render_member_template(
+                :member_review_missing_contract,
+                slack_user,
+                contract_type: contract_type,
+                document_url: "#{@base_url}/members/#{slack_user.member_id}"
+              ),
               slack_user
             )
             ::MemberMailer.request_document(contract_type, slack_user.member_id.as_json).deliver_later
@@ -172,34 +197,16 @@ task :member_review => :environment do
 
       # Notify admins and members of expired memberships with active rentals
       if @expired_with_rentals.length > 0
-        add_context("Expired members with active rentals", @expired_with_rentals)
-        rental_messages = @expired_with_rentals.map do |member|
-          rentals = Rental.where(member_id: member.id, :status.in => ["active", "vacating"])
-          rental_numbers = rentals.map(&:number).join(", ")
-          has_rental_sub = rentals.any? { |r| r.subscription_id.present? }
-          sub_flag = has_rental_sub ? " _(rental sub still active — billing!)_" : ""
-          "<#{@base_url}/members/#{member.id}|#{member.fullname}> — Rentals: #{rental_numbers}#{sub_flag}"
-        end
+        add_context("Membership ended, but they still have an active rental", @expired_with_rentals)
+        rental_messages = @expired_with_rentals.map { |member| RentalLapseNotifier.weekly_line(member) }.compact
         @management_messages.push({
           "type": "section",
           "text": { "type": "mrkdwn", "text": rental_messages.join("\n") }
         })
 
-        # Also notify each member directly so they know to renew
-        @expired_with_rentals.each do |member|
-          slack_user = SlackUser.find_by(member_id: member.id)
-          next unless slack_user
-
-          rentals = Rental.where(member_id: member.id, :status.in => ["active", "vacating"])
-          rental_numbers = rentals.map { |r| "##{r.number}" }.join(", ")
-
-          ::Service::SlackConnector.send_slack_message(
-            "Hi #{member.firstname}, your membership has expired but you still have an active rental (#{rental_numbers}). " \
-            "You must renew your membership to keep your rental in good standing. " \
-            "Please <#{@base_url}/members/#{member.id}|log in and renew> as soon as possible.",
-            slack_user.slack_id
-          )
-        end
+        # Tell each member too: a Slack DM, or an email when they have no Slack account.
+        # Revoked and suspended members cannot be reached, so the staff post above says so.
+        @expired_with_rentals.each { |member| RentalLapseNotifier.notify_member_weekly(member) }
       end
 
       # Send management their report

@@ -6,30 +6,38 @@ namespace :db do
       exit 1
     end
 
+    require Rails.root.join('lib/service/database_safety')
+    ::Service::DatabaseSafety.ensure_safe_mlab_uri!(operation: 'db:db_reset')
+
     require 'factory_bot'
     require "database_cleaner/mongoid"
 
     puts "Cleaning db..."
 
     Dir[Rails.root.join('spec/support/**/*.rb')].each { |f| require f }
-    DatabaseCleaner.strategy = :deletion
-    DatabaseCleaner.clean
-    FactoryBot.rewind_sequences
+    AvailableShopCache.with_bulk_changes do
+      DatabaseCleaner.strategy = :deletion
+      DatabaseCleaner.clean
+      FactoryBot.rewind_sequences
 
-    # Braintree cleanup options — only meaningful in test (CI) where we want a
-    # clean sandbox. Skipped in development to preserve local sandbox data.
-    if Rails.env.test?
-      braintree_options = (args[:options] || "").split(",").map(&:to_sym)
+      # Braintree cleanup options — only meaningful in test (CI) where we want a
+      # clean sandbox. Skipped in development to preserve local sandbox data.
+      if Rails.env.test?
+        braintree_options = (args[:options] || "").split(",").map(&:to_sym)
 
-      if braintree_options.length > 0
-        gateway = ::Service::BraintreeGateway.connect_gateway
-        cancel_subscriptions(gateway) if braintree_options.include?(:subscriptions)
-        delete_payment_methods(gateway) if braintree_options.include?(:payment_methods)
+        if braintree_options.length > 0
+          gateway = ::Service::BraintreeGateway.connect_gateway
+          cancel_subscriptions(gateway) if braintree_options.include?(:subscriptions)
+          delete_payment_methods(gateway) if braintree_options.include?(:payment_methods)
+        end
       end
-    end
 
-    puts "DB cleaned, seeding..."
-    SeedData.new.call
+      puts "DB cleaned, seeding..."
+      SeedData.new.call
+    end
+    puts "Creating verified unique indexes..."
+    Rake::Task["data:ensure_unique_indexes"].reenable
+    Rake::Task["data:ensure_unique_indexes"].invoke
     puts "Seeding complete, done."
   end
 
@@ -113,6 +121,21 @@ namespace :db do
         } }
     end
   end
+
+  # Toggles the signup maintenance lockout flag directly, without going
+  # through the (currently flaky) Portal Settings UI.
+  # Usage: rake "db:set_signup_lockout[true]"  /  rake "db:set_signup_lockout[false]"
+  task :set_signup_lockout, [:enabled] => :environment do |t, args|
+    enabled = args[:enabled].to_s.strip.downcase
+
+    unless %w[true false].include?(enabled)
+      puts 'Usage: rake "db:set_signup_lockout[true]" or rake "db:set_signup_lockout[false]"'
+      exit 1
+    end
+
+    SystemConfig.set(SystemConfig::SIGNUP_LOCKOUT_ENABLED, enabled)
+    puts "signup_lockout_enabled set to #{enabled}"
+  end
 end
 
 def cancel_subscriptions(gateway)
@@ -172,7 +195,6 @@ namespace :db do
     seeder.send(:create_historical_checkouts)
     seeder.send(:create_historical_volunteer_data)
     seeder.send(:create_historical_checkins)
-    seeder.send(:create_membership_snapshots)
     puts "Analytics seeding complete."
   end
 end

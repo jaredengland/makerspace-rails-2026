@@ -1,7 +1,8 @@
 class ToolCatalogSerializer < ActiveModel::Serializer
-  attributes :id, :name, :description, :shop_id, :shop_name, :prerequisite_ids,
+  attribute :checkout_training_plan_url
+  attributes :open, :id, :name, :description, :shop_id, :shop_name, :prerequisite_ids, :out_of_service,
              :prerequisite_names, :unmet_prerequisite_ids,
-             :unmet_prerequisite_names, :requestable
+             :unmet_prerequisite_names, :requestable, :allow_pending
 
   def shop_name
     object.shop.try(:name)
@@ -12,7 +13,7 @@ class ToolCatalogSerializer < ActiveModel::Serializer
   end
 
   def unmet_prerequisite_ids
-    checked_out_tool_ids = ToolCheckout.where(member_id: scope.id, revoked_at: nil).pluck(:tool_id).map(&:to_s)
+    checked_out_tool_ids = ToolCheckout.valid_at.where(member_id: scope.id, revoked_at: nil).pluck(:tool_id).map(&:to_s)
     object.prerequisite_ids.map(&:to_s).reject { |pid| checked_out_tool_ids.include?(pid) }
   end
 
@@ -21,6 +22,6 @@ class ToolCatalogSerializer < ActiveModel::Serializer
   end
 
   def requestable
-    true
+    !object.open
   end
 end

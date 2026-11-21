@@ -3,6 +3,7 @@ class ApplicationController < ActionController::Base
   include ::Error::ErrorHandler
   include SlackService
   include SetCurrentRequestDetails
+  include MobileSessionPersistence
   include ActionView::Helpers::SanitizeHelper
 
   protect_from_forgery with: :exception
@@ -51,9 +52,15 @@ class ApplicationController < ActionController::Base
     end.uniq
   end
 
+  # Checks the fully negotiated response format (request.format), not just
+  # params[:format] -- an explicit ?format=json/.json extension isn't the
+  # only way a request ends up non-HTML. A bare path hit with an
+  # `Accept: application/json` header (typical of bots/scanners probing for
+  # API endpoints) negotiates to JSON too, and params[:format] alone can't
+  # see that, letting it through to blow up on the HTML-only layout template.
   def allow_only_html_requests
-    if params[:format] && params[:format] != "html"
-      Rails.logger.info("[allow_only_html] #{scrub_log_value(params[:format])}.")
+    unless request.format.html?
+      Rails.logger.info("[allow_only_html] #{scrub_log_value(request.format.to_s)}.")
       render plain: "Not Found", status: 404
     end
   end
@@ -88,11 +95,44 @@ class ApplicationController < ActionController::Base
   end
 
   def can_view_disabled_tools?
-    is_admin? || is_board_member? || is_resource_manager?
+    is_admin? || is_board_member?
+  end
+
+  def manages_shop?(shop_or_id)
+    current_member.try(:manages_shop?, shop_or_id) || false
+  end
+
+  def can_manage_shop?(shop_or_id)
+    is_admin? || is_board_member? || manages_shop?(shop_or_id)
+  end
+
+  def ordinary_checkout_approver_for_tool?(tool)
+    return false unless current_member.try(:valid_for_checkout_request?)
+    return false if tool.nil? || tool.disabled?
+    CheckoutApprover.find_by(member_id: current_member.id).try(:can_approve_tool?, tool) || false
+  end
+
+  def can_approve_checkout_for_tool?(tool)
+    is_admin? || is_board_member? || manages_shop?(tool.try(:shop_id)) ||
+      ordinary_checkout_approver_for_tool?(tool)
+  end
+
+  def managed_shop_ids
+    return Shop.all.pluck(:id).map(&:to_s) if is_admin? || is_board_member?
+    return Array(current_member.resource_manager_shop_ids).map(&:to_s) if is_resource_manager?
+    []
+  end
+
+  def checkout_visible_tool_ids
+    ids = Tool.where(:shop_id.in => managed_shop_ids).pluck(:id).map(&:to_s)
+    if current_member.try(:valid_for_checkout_request?)
+      ids |= CheckoutApprover.allowed_tool_ids_for_member(current_member.id)
+    end
+    ids
   end
 
   def filter_requests
-    if params[:format] && (/js|png|svg|txt|html|json/ =~ params[:format]).nil?
+    if params[:format] && (/js|png|svg|txt|html|json|xml/ =~ params[:format]).nil?
       Rails.logger.info("[filter_requests] #{scrub_log_value(params[:format])}.")
       raise Error::NotFound.new
     end
@@ -130,12 +170,24 @@ class ApplicationController < ActionController::Base
 
     session.delete(:totp_pending_member_id)
     session.delete(:totp_pending_expires_at)
+    session.delete(:mobile_remember_pending)
     sign_out(:member)
   end
 
   def totp_challenge_exempt_request?
+    return true if controller_path == 'sessions' && action_name == 'destroy'
     return true if controller_path == 'members/totp_sessions' && action_name == 'create'
     return true if controller_path == 'client_config' && action_name == 'index'
+    # warden.authenticate! establishes the Devise session before this gate
+    # ever sees a pending TOTP challenge (see SessionsController#create), so
+    # member_signed_in? is already true the moment a TOTP-required login
+    # starts. Without this exemption, any later call to sign_in -- a
+    # deliberate retry, a second tab, a stray request racing the code entry
+    # step -- gets rejected here instead of restarting the login/TOTP flow,
+    # with no way out except clearing cookies. sign_in itself still requires
+    # a correct password (warden.authenticate!) and still re-demands a fresh
+    # TOTP code when one is enrolled, so this doesn't weaken the challenge.
+    return true if controller_path == 'sessions' && action_name == 'create'
 
     false
   end

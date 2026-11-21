@@ -2,6 +2,10 @@
 
 # Configure sensitive parameters which will be filtered from the log file.
 Rails.application.config.filter_parameters += [
+  :endpoint_url,
+  :reporter_id, :actor_id, :member_ids, :assignee_ids, :note, :description,
+  :announcement_note, :private_metadata, :response_url,
+  :payload, # Slack's JSON string can contain a nested response URL.
   :password,
   :password_confirmation,
   :secret,
@@ -11,5 +15,7 @@ Rails.application.config.filter_parameters += [
   :client_secret,
   :private_key,
   :otp_secret,
-  :otp_secret_encrypted
+  :otp_secret_encrypted,
+  :bt_signature,
+  :bt_payload
 ]
